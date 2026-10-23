@@ -1,0 +1,4 @@
+pyVim
+pyVmomi
+vsanapiutils
+vsanmgmtObjects

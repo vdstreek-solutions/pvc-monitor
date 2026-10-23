@@ -1,0 +1,15 @@
+{{- if and .Values.gateway.enabled .Values.certificate.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "pvc-monitor.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pvc-monitor.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "pvc-monitor.tlsSecretName" . }}
+  dnsNames:
+    - {{ .Values.gateway.hostname | quote }}
+  issuerRef:
+    {{- toYaml .Values.certificate.issuerRef | nindent 4 }}
+{{- end }}

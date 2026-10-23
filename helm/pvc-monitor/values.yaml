@@ -1,0 +1,96 @@
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+
+image:
+  repository: harbor.containers.wurnet.nl/mdt-cps/pvc-monitor
+  tag: ""            # defaults to .Chart.AppVersion
+  pullPolicy: Always
+
+serviceAccount:
+  create: true
+  name: ""           # defaults to the fullname
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+resources:
+  requests:
+    memory: 256Mi
+    cpu: 100m
+  limits:
+    memory: 512Mi
+    cpu: 500m
+
+# Credentials / app config, injected via envFrom.
+secret:
+  # Use a Secret you manage yourself (must exist in the release namespace).
+  # When set, the chart does not create one.
+  existingSecret: ""
+  # Otherwise the chart creates a Secret from these values. Supply real values with
+  # `--set-file`/a private values file or (better) use existingSecret / an external secret operator.
+  data:
+    VCENTER_HOST: ""
+    VCENTER_USER: ""
+    VCENTER_PASSWORD: ""
+    VCENTER_PORT: "443"
+    VCENTER_VERIFY_SSL: "false"
+
+    # Email alerting
+    SMTP_HOST: ""
+    SMTP_PORT: "587"
+    SMTP_USE_TLS: "true"
+    SMTP_FROM: ""
+    SMTP_USER: ""
+    SMTP_PASSWORD: ""
+    ALERT_EMAIL_TO: ""
+    ALERT_SNAPSHOT_AGE_DAYS: "7"
+    ALERT_CHECK_INTERVAL_HOURS: "24"
+
+    # Dex OIDC authentication - leave OIDC_ISSUER empty to disable.
+    OIDC_ISSUER: ""
+    OIDC_CLIENT_ID: ""
+    OIDC_CLIENT_SECRET: ""
+    OIDC_REDIRECT_URI: ""
+    OIDC_SCOPES: "openid email profile groups"
+    # Comma-separated Dex groups allowed to access the app; empty allows all authenticated users.
+    ALLOWED_GROUPS: ""
+    SESSION_SECRET: ""
+    SESSION_SECURE: "true"
+    AUTH_ENABLED: "true"
+
+# Gateway API exposure (replaces the former Ingress).
+gateway:
+  enabled: true
+  hostname: pvc-monitor.containers-test.wurnet.nl
+  # Existing Gateway the ListenerSet attaches to. It must allow ListenerSets
+  # (spec.allowedListeners.namespaces.from).
+  parentRef:
+    name: ""
+    namespace: ""
+    group: gateway.networking.k8s.io
+    kind: Gateway
+  listenerSet:
+    name: ""         # defaults to the fullname
+    listenerName: https
+    port: 443
+    protocol: HTTPS
+    tlsMode: Terminate
+    # Secret holding the TLS cert; defaults to the hostname (as the old Ingress did).
+    tlsSecretName: ""
+  httpRoute:
+    annotations: {}
+    path: /
+    pathType: PathPrefix
+
+# cert-manager Certificate for the listener's TLS secret
+# (the Ingress cert-manager annotation does not apply to ListenerSets).
+certificate:
+  enabled: true
+  issuerRef:
+    name: harica
+    kind: ClusterIssuer
+    group: cert-manager.io
