@@ -1,3 +1,4 @@
+{{- include "pvc-monitor.validate" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -14,50 +15,101 @@ spec:
     metadata:
       labels:
         {{- include "pvc-monitor.selectorLabels" . | nindent 8 }}
-      {{- if not .Values.secret.existingSecret }}
-      annotations:
-        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
-      {{- end }}
+      # No checksum/secret annotation: a hash of the rendered Secret in pod metadata
+      # is readable by anyone who can read Pods and lets them test guesses of the
+      # secret values. Hashing only key names would not detect value changes, so it
+      # is dropped; restart after changing the Secret (`kubectl rollout restart`) or
+      # use a reloader controller.
     spec:
       serviceAccountName: {{ include "pvc-monitor.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
 
       # No K8S_SERVER / K8S_TOKEN / KUBECONFIG_PATH -> k8s_client falls through
       # to load_incluster_config(), which reads the mounted ServiceAccount token.
       containers:
         - name: pvc-monitor
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: {{ include "pvc-monitor.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
-            - containerPort: {{ .Values.service.targetPort }}
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
 
           envFrom:
             - secretRef:
                 name: {{ include "pvc-monitor.secretName" . }}
+          {{- if or .Values.forwardedAllowIps .Values.vcenterCA.configMapName .Values.vcenterCA.secretName }}
+          env:
+            {{- with .Values.forwardedAllowIps }}
+            - name: FORWARDED_ALLOW_IPS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if or .Values.vcenterCA.configMapName .Values.vcenterCA.secretName }}
+            - name: VCENTER_CA_FILE
+              value: {{ printf "/etc/pvc-monitor/vcenter-ca/%s" .Values.vcenterCA.key | quote }}
+            {{- end }}
+          {{- end }}
 
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
 
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+
           livenessProbe:
             httpGet:
               path: /healthz
-              port: {{ .Values.service.targetPort }}
-            initialDelaySeconds: 10
+              port: http
             periodSeconds: 30
+            timeoutSeconds: 5
             failureThreshold: 3
 
           readinessProbe:
             httpGet:
               path: /healthz
-              port: {{ .Values.service.targetPort }}
-            initialDelaySeconds: 5
+              port: http
             periodSeconds: 10
+            timeoutSeconds: 5
 
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
-            runAsNonRoot: true
-            runAsUser: 1000
 
-      securityContext:
-        fsGroup: 1000
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if or .Values.vcenterCA.configMapName .Values.vcenterCA.secretName }}
+            - name: vcenter-ca
+              mountPath: /etc/pvc-monitor/vcenter-ca
+              readOnly: true
+            {{- end }}
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        {{- if .Values.vcenterCA.configMapName }}
+        - name: vcenter-ca
+          configMap:
+            name: {{ .Values.vcenterCA.configMapName }}
+        {{- else if .Values.vcenterCA.secretName }}
+        - name: vcenter-ca
+          secret:
+            secretName: {{ .Values.vcenterCA.secretName }}
+        {{- end }}

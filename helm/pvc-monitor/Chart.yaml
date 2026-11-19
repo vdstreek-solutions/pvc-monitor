@@ -2,5 +2,7 @@ apiVersion: v2
 name: pvc-monitor
 description: vCenter / Kubernetes PVC and snapshot monitor
 type: application
-version: 0.1.0
-appVersion: "v0.0.2"
+version: 0.2.0
+# No public image is published. Build the image yourself and set image.repository
+# plus image.digest (preferred) or image.tag; this placeholder is not a real tag.
+appVersion: "unset-build-your-own-image"

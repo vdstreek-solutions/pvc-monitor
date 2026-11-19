@@ -4,13 +4,21 @@ fullnameOverride: ""
 replicaCount: 1
 
 image:
-  repository: harbor.containers.wurnet.nl/mdt-cps/pvc-monitor
-  tag: ""            # defaults to .Chart.AppVersion
-  pullPolicy: Always
+  # Build and push your own image; there is no public one.
+  repository: registry.example.com/pvc-monitor
+  tag: ""            # defaults to .Chart.AppVersion (a placeholder)
+  # Image digest ("sha256:..."). When set it takes precedence over tag.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# Pull secrets for a private registry, e.g. [{name: my-registry-credentials}].
+imagePullSecrets: []
 
 serviceAccount:
   create: true
-  name: ""           # defaults to the fullname
+  # Required when create is false: the existing ServiceAccount that receives
+  # cluster-wide read access to PVs, PVCs and VolumeSnapshots.
+  name: ""           # defaults to the fullname when create is true
 
 service:
   type: ClusterIP
@@ -25,10 +33,26 @@ resources:
     memory: 512Mi
     cpu: 500m
 
+# Addresses (comma-separated IPs or CIDRs) whose X-Forwarded-* headers uvicorn
+# trusts. Empty keeps the uvicorn default (loopback only), so the scheme and
+# client address sent by the Gateway are ignored. Set it to the Gateway data-plane
+# pod range so the app sees the original https scheme.
+forwardedAllowIps: ""
+
+# CA bundle used to verify the vCenter TLS certificate. Name an existing ConfigMap
+# or Secret in the release namespace (not both); the chart mounts it read-only and
+# sets VCENTER_CA_FILE. Leave both empty to use the system trust store.
+vcenterCA:
+  configMapName: ""
+  secretName: ""
+  key: ca.crt
+
 # Credentials / app config, injected via envFrom.
 secret:
   # Use a Secret you manage yourself (must exist in the release namespace).
-  # When set, the chart does not create one.
+  # When set, the chart does not create one and cannot check its contents; the
+  # application itself refuses to start when authentication is enabled but the
+  # OIDC settings or SESSION_SECRET are missing.
   existingSecret: ""
   # Otherwise the chart creates a Secret from these values. Supply real values with
   # `--set-file`/a private values file or (better) use existingSecret / an external secret operator.
@@ -37,7 +61,8 @@ secret:
     VCENTER_USER: ""
     VCENTER_PASSWORD: ""
     VCENTER_PORT: "443"
-    VCENTER_VERIFY_SSL: "false"
+    # Verify the vCenter certificate. Use vcenterCA for a private CA instead of disabling this.
+    VCENTER_VERIFY_SSL: "true"
 
     # Email alerting
     SMTP_HOST: ""
@@ -48,24 +73,35 @@ secret:
     SMTP_PASSWORD: ""
     ALERT_EMAIL_TO: ""
     ALERT_SNAPSHOT_AGE_DAYS: "7"
+    # Minimum 1.
     ALERT_CHECK_INTERVAL_HOURS: "24"
 
-    # Dex OIDC authentication - leave OIDC_ISSUER empty to disable.
+    # OIDC authentication. With AUTH_ENABLED other than "false", OIDC_ISSUER,
+    # OIDC_CLIENT_ID, OIDC_CLIENT_SECRET and SESSION_SECRET are required; rendering
+    # fails without them. AUTH_ENABLED: "false" is only accepted when the app is not
+    # exposed (gateway.enabled=false and service.type=ClusterIP).
+    AUTH_ENABLED: "true"
     OIDC_ISSUER: ""
     OIDC_CLIENT_ID: ""
     OIDC_CLIENT_SECRET: ""
+    # Full callback URL, e.g. https://pvc-monitor.example.com/auth/callback
     OIDC_REDIRECT_URI: ""
     OIDC_SCOPES: "openid email profile groups"
-    # Comma-separated Dex groups allowed to access the app; empty allows all authenticated users.
+    # Comma-separated groups allowed to access the app; empty allows all authenticated users.
     ALLOWED_GROUPS: ""
+    # At least 32 random characters, e.g. `openssl rand -hex 32`.
     SESSION_SECRET: ""
     SESSION_SECURE: "true"
-    AUTH_ENABLED: "true"
+    SESSION_MAX_AGE_HOURS: "12"
+    # Comma-separated Host header values the app accepts, e.g. the gateway hostname.
+    TRUSTED_HOSTS: ""
+    # Exposes vSphere diagnostics; keep disabled outside troubleshooting.
+    ENABLE_DEBUG_ENDPOINT: "false"
 
-# Gateway API exposure (replaces the former Ingress).
+# Gateway API exposure.
 gateway:
   enabled: true
-  hostname: pvc-monitor.containers-test.wurnet.nl
+  hostname: pvc-monitor.example.com
   # Existing Gateway the ListenerSet attaches to. It must allow ListenerSets
   # (spec.allowedListeners.namespaces.from).
   parentRef:
@@ -79,18 +115,35 @@ gateway:
     port: 443
     protocol: HTTPS
     tlsMode: Terminate
-    # Secret holding the TLS cert; defaults to the hostname (as the old Ingress did).
+    # Secret holding the TLS cert; defaults to the hostname.
     tlsSecretName: ""
   httpRoute:
     annotations: {}
     path: /
     pathType: PathPrefix
 
-# cert-manager Certificate for the listener's TLS secret
-# (the Ingress cert-manager annotation does not apply to ListenerSets).
+# cert-manager Certificate for the listener's TLS secret.
 certificate:
   enabled: true
   issuerRef:
-    name: harica
+    name: ""         # required when certificate.enabled and gateway.enabled
     kind: ClusterIssuer
     group: cert-manager.io
+
+# Ingress NetworkPolicy for the pod. Only the peers in ingressFrom may reach the
+# HTTP port; everything else is denied. Set ingressFrom to the Gateway data plane,
+# for example:
+#   ingressFrom:
+#     - namespaceSelector:
+#         matchLabels:
+#           kubernetes.io/metadata.name: gateway-system
+#       podSelector:
+#         matchLabels:
+#           app.kubernetes.io/name: my-gateway
+# Kubelet probes come from the pod's own node. NetworkPolicy does not block traffic
+# from the node a pod runs on, so probes keep working without a rule; this also
+# means other host-network processes on that node are not restricted. With gateway.enabled an empty ingressFrom fails rendering;
+# without it, an empty list denies all ingress.
+networkPolicy:
+  enabled: true
+  ingressFrom: []
