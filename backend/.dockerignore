@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+venv
+.venv*
+__pycache__
+*.py[cod]
+.pytest_cache
+test_*.py
+tests
+requirements-dev.*
+Dockerfile
+.dockerignore
+.DS_Store
