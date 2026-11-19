@@ -1,0 +1,6 @@
+# Development and test dependencies, constrained to the runtime lock.
+#   uv pip compile requirements-dev.in --generate-hashes --python-version 3.12 \
+#     --universal -o requirements-dev.txt
+# Install with: pip install --require-hashes -r requirements.txt -r requirements-dev.txt
+-c requirements.txt
+pytest>=8.0
