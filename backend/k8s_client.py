@@ -1,19 +1,33 @@
-import os
+import logging
+
 from kubernetes import client, config
 from kubernetes.client import ApiClient, Configuration
 from kubernetes.client.rest import ApiException
-from dotenv import load_dotenv
 
-load_dotenv()
+from settings import Unavailable, env_bool, env_str
 
-KUBECONFIG_PATH = os.getenv("KUBECONFIG_PATH", "")
-K8S_CONTEXT     = os.getenv("K8S_CONTEXT", "") or None
-K8S_SERVER      = os.getenv("K8S_SERVER", "")
-K8S_TOKEN       = os.getenv("K8S_TOKEN", "")
-K8S_VERIFY_SSL  = os.getenv("K8S_VERIFY_SSL", "true").lower() == "true"
+logger = logging.getLogger(__name__)
+
+KUBECONFIG_PATH = env_str("KUBECONFIG_PATH")
+K8S_CONTEXT     = env_str("K8S_CONTEXT") or None
+K8S_SERVER      = env_str("K8S_SERVER")
+K8S_TOKEN       = env_str("K8S_TOKEN")
+K8S_VERIFY_SSL  = env_bool("K8S_VERIFY_SSL", True)
+K8S_CA_FILE     = env_str("K8S_CA_FILE")  # CA bundle for K8S_SERVER
 VSPHERE_DRIVER  = "csi.vsphere.vmware.com"
 SNAPSHOT_GROUP  = "snapshot.storage.k8s.io"
 SNAPSHOT_VER    = "v1"
+
+# (connect, read) timeout in seconds for every API call.
+REQUEST_TIMEOUT = (10, 60)
+# Objects per list page; only one page of full objects is held at a time.
+PAGE_SIZE = 250
+
+if K8S_SERVER and K8S_TOKEN and not K8S_VERIFY_SSL:
+    logger.warning(
+        "Kubernetes: K8S_VERIFY_SSL=false, the API server certificate is NOT verified "
+        "and K8S_TOKEN can be intercepted"
+    )
 
 
 def _get_api_client() -> ApiClient:
@@ -35,8 +49,8 @@ def _get_api_client() -> ApiClient:
         cfg.api_key["authorization"] = K8S_TOKEN
         cfg.api_key_prefix["authorization"] = "Bearer"
         cfg.verify_ssl              = K8S_VERIFY_SSL
-        if not K8S_VERIFY_SSL:
-            cfg.ssl_ca_cert = None
+        if K8S_CA_FILE:
+            cfg.ssl_ca_cert = K8S_CA_FILE
         return ApiClient(configuration=cfg)
 
     # Options 2-4: kubeconfig-based (OIDC token refresh handled by oauthlib)
@@ -53,58 +67,90 @@ def _get_api_client() -> ApiClient:
         except config.ConfigException:
             return config.new_client_from_config(context=K8S_CONTEXT)
     except config.ConfigException as exc:
-        raise RuntimeError(f"K8s not configured: {exc}") from exc
+        logger.warning("Kubernetes: no usable configuration: %r", str(exc))
+        raise Unavailable("Kubernetes is not configured") from exc
+
+
+def _list_typed(list_call, **kwargs):
+    """Yield every item of a typed list call, one page at a time.
+
+    Any error, including an expired continue token (410), propagates: callers
+    must never work with a partial list.
+    """
+    token = None
+    while True:
+        page = list_call(limit=PAGE_SIZE, _continue=token, _request_timeout=REQUEST_TIMEOUT, **kwargs)
+        yield from page.items or []
+        token = page.metadata._continue if page.metadata else None
+        if not token:
+            return
+
+
+def _list_custom(custom: client.CustomObjectsApi, plural: str):
+    """Yield every item of a cluster-wide custom object list, one page at a time."""
+    token = None
+    while True:
+        page = custom.list_cluster_custom_object(
+            group=SNAPSHOT_GROUP, version=SNAPSHOT_VER, plural=plural,
+            limit=PAGE_SIZE, _continue=token, _request_timeout=REQUEST_TIMEOUT,
+        )
+        yield from page.get("items") or []
+        token = (page.get("metadata") or {}).get("continue")
+        if not token:
+            return
 
 
 def check_k8s_connectivity() -> dict:
     try:
         with _get_api_client() as api:
-            ver = client.VersionApi(api).get_code()
+            ver = client.VersionApi(api).get_code(_request_timeout=REQUEST_TIMEOUT)
         return {
             "connected": True,
             "server_version": f"v{ver.major}.{ver.minor}",
             "git_version": ver.git_version,
         }
-    except RuntimeError as exc:
+    except Unavailable as exc:
         return {"connected": False, "configured": False, "error": str(exc)}
-    except Exception as exc:
-        return {"connected": False, "configured": True, "error": str(exc)}
+    except Exception:
+        logger.exception("Kubernetes: connectivity check failed")
+        return {"connected": False, "configured": True, "error": "connection failed, see the server log"}
 
 
 def get_k8s_persistent_volumes() -> list[dict]:
-    with _get_api_client() as api:
-        pvs = client.CoreV1Api(api).list_persistent_volume()
+    """All PVs. Raises if the list cannot be read completely: the result
+    decides which vSphere disks count as claimed."""
     result = []
-    for pv in pvs.items:
-        if pv.spec.csi:
-            driver       = pv.spec.csi.driver
-            volume_handle = pv.spec.csi.volume_handle
-            fs_type      = pv.spec.csi.fs_type or "ext4"
-        elif pv.spec.vsphere_volume:
-            driver       = "kubernetes.io/vsphere-volume"
-            volume_handle = pv.spec.vsphere_volume.volume_path
-            fs_type      = pv.spec.vsphere_volume.fs_type or "ext4"
-        else:
-            driver       = _pv_plugin_name(pv)
-            volume_handle = None
-            fs_type      = None
+    with _get_api_client() as api:
+        for pv in _list_typed(client.CoreV1Api(api).list_persistent_volume):
+            if pv.spec.csi:
+                driver       = pv.spec.csi.driver
+                volume_handle = pv.spec.csi.volume_handle
+                fs_type      = pv.spec.csi.fs_type or "ext4"
+            elif pv.spec.vsphere_volume:
+                driver       = "kubernetes.io/vsphere-volume"
+                volume_handle = pv.spec.vsphere_volume.volume_path
+                fs_type      = pv.spec.vsphere_volume.fs_type or "ext4"
+            else:
+                driver       = _pv_plugin_name(pv)
+                volume_handle = None
+                fs_type      = None
 
-        result.append({
-            "name": pv.metadata.name,
-            "driver": driver,
-            "volume_handle": volume_handle,
-            "capacity": pv.spec.capacity.get("storage", "N/A"),
-            "access_modes": pv.spec.access_modes or [],
-            "reclaim_policy": pv.spec.persistent_volume_reclaim_policy,
-            "status": pv.status.phase,
-            "storage_class": pv.spec.storage_class_name or "N/A",
-            "claim_ref": (
-                f"{pv.spec.claim_ref.namespace}/{pv.spec.claim_ref.name}"
-                if pv.spec.claim_ref else None
-            ),
-            "fs_type": fs_type,
-            "created": pv.metadata.creation_timestamp.isoformat() if pv.metadata.creation_timestamp else None,
-        })
+            result.append({
+                "name": pv.metadata.name,
+                "driver": driver,
+                "volume_handle": volume_handle,
+                "capacity": (pv.spec.capacity or {}).get("storage", "N/A"),
+                "access_modes": pv.spec.access_modes or [],
+                "reclaim_policy": pv.spec.persistent_volume_reclaim_policy,
+                "status": pv.status.phase if pv.status else None,
+                "storage_class": pv.spec.storage_class_name or "N/A",
+                "claim_ref": (
+                    f"{pv.spec.claim_ref.namespace}/{pv.spec.claim_ref.name}"
+                    if pv.spec.claim_ref else None
+                ),
+                "fs_type": fs_type,
+                "created": pv.metadata.creation_timestamp.isoformat() if pv.metadata.creation_timestamp else None,
+            })
     return result
 
 
@@ -123,83 +169,71 @@ def _pv_plugin_name(pv) -> str:
 
 
 def get_k8s_persistent_volume_claims() -> list[dict]:
-    with _get_api_client() as api:
-        v1   = client.CoreV1Api(api)
-        pvcs = v1.list_persistent_volume_claim_for_all_namespaces()
-
     result = []
-    for pvc in pvcs.items:
-        requested = (pvc.spec.resources.requests or {}).get("storage", "N/A")
-        actual    = (pvc.status.capacity or {}).get("storage", requested)
-        result.append({
-            "name": pvc.metadata.name,
-            "namespace": pvc.metadata.namespace,
-            "status": pvc.status.phase,
-            "volume_name": pvc.spec.volume_name or "—",
-            "capacity": actual,
-            "access_modes": pvc.spec.access_modes or [],
-            "storage_class": pvc.spec.storage_class_name or "N/A",
-            "created": pvc.metadata.creation_timestamp.isoformat() if pvc.metadata.creation_timestamp else None,
-        })
+    with _get_api_client() as api:
+        v1 = client.CoreV1Api(api)
+        for pvc in _list_typed(v1.list_persistent_volume_claim_for_all_namespaces):
+            requested = (pvc.spec.resources.requests or {}).get("storage", "N/A") if pvc.spec.resources else "N/A"
+            actual    = ((pvc.status.capacity if pvc.status else None) or {}).get("storage", requested)
+            result.append({
+                "name": pvc.metadata.name,
+                "namespace": pvc.metadata.namespace,
+                "status": pvc.status.phase if pvc.status else None,
+                "volume_name": pvc.spec.volume_name or "—",
+                "capacity": actual,
+                "access_modes": pvc.spec.access_modes or [],
+                "storage_class": pvc.spec.storage_class_name or "N/A",
+                "created": pvc.metadata.creation_timestamp.isoformat() if pvc.metadata.creation_timestamp else None,
+            })
     return result
 
 
 def get_k8s_volume_snapshots() -> list[dict]:
+    result = []
     with _get_api_client() as api:
-        custom = client.CustomObjectsApi(api)
         try:
-            raw = custom.list_cluster_custom_object(
-                group=SNAPSHOT_GROUP, version=SNAPSHOT_VER, plural="volumesnapshots"
-            )
+            for snap in _list_custom(client.CustomObjectsApi(api), "volumesnapshots"):
+                meta   = snap.get("metadata") or {}
+                spec   = snap.get("spec") or {}
+                status = snap.get("status") or {}
+                result.append({
+                    "name": meta.get("name"),
+                    "namespace": meta.get("namespace"),
+                    "source_pvc": (spec.get("source") or {}).get("persistentVolumeClaimName"),
+                    "snapshot_class": spec.get("volumeSnapshotClassName"),
+                    "content_name": status.get("boundVolumeSnapshotContentName"),
+                    "ready": status.get("readyToUse", False),
+                    "restore_size": status.get("restoreSize"),
+                    "created": meta.get("creationTimestamp"),
+                })
         except ApiException as exc:
             if exc.status in (404, 405):
-                raise RuntimeError("VolumeSnapshot CRD not installed") from exc
+                raise Unavailable("VolumeSnapshot CRD not installed") from exc
             raise
-
-    result = []
-    for snap in raw.get("items", []):
-        meta   = snap.get("metadata", {})
-        spec   = snap.get("spec", {})
-        status = snap.get("status", {})
-        result.append({
-            "name": meta.get("name"),
-            "namespace": meta.get("namespace"),
-            "source_pvc": spec.get("source", {}).get("persistentVolumeClaimName"),
-            "snapshot_class": spec.get("volumeSnapshotClassName"),
-            "content_name": status.get("boundVolumeSnapshotContentName"),
-            "ready": status.get("readyToUse", False),
-            "restore_size": status.get("restoreSize"),
-            "created": meta.get("creationTimestamp"),
-        })
     return result
 
 
 def get_k8s_volume_snapshot_contents() -> list[dict]:
+    result = []
     with _get_api_client() as api:
-        custom = client.CustomObjectsApi(api)
         try:
-            raw = custom.list_cluster_custom_object(
-                group=SNAPSHOT_GROUP, version=SNAPSHOT_VER, plural="volumesnapshotcontents"
-            )
+            for content in _list_custom(client.CustomObjectsApi(api), "volumesnapshotcontents"):
+                meta     = content.get("metadata") or {}
+                spec     = content.get("spec") or {}
+                status   = content.get("status") or {}
+                snap_ref = spec.get("volumeSnapshotRef") or {}
+                result.append({
+                    "name": meta.get("name"),
+                    "driver": spec.get("driver"),
+                    "snapshot_handle": status.get("snapshotHandle") or (spec.get("source") or {}).get("snapshotHandle"),
+                    "bound_snapshot": f"{snap_ref.get('namespace')}/{snap_ref.get('name')}" if snap_ref.get("name") else None,
+                    "reclaim_policy": spec.get("deletionPolicy"),
+                    "ready": status.get("readyToUse", False),
+                    "restore_size": status.get("restoreSize"),
+                    "created": meta.get("creationTimestamp"),
+                })
         except ApiException as exc:
             if exc.status in (404, 405):
-                raise RuntimeError("VolumeSnapshotContent CRD not installed") from exc
+                raise Unavailable("VolumeSnapshotContent CRD not installed") from exc
             raise
-
-    result = []
-    for content in raw.get("items", []):
-        meta     = content.get("metadata", {})
-        spec     = content.get("spec", {})
-        status   = content.get("status", {})
-        snap_ref = spec.get("volumeSnapshotRef", {})
-        result.append({
-            "name": meta.get("name"),
-            "driver": spec.get("driver"),
-            "snapshot_handle": status.get("snapshotHandle") or spec.get("source", {}).get("snapshotHandle"),
-            "bound_snapshot": f"{snap_ref.get('namespace')}/{snap_ref.get('name')}" if snap_ref.get("name") else None,
-            "reclaim_policy": spec.get("deletionPolicy"),
-            "ready": status.get("readyToUse", False),
-            "restore_size": status.get("restoreSize"),
-            "created": meta.get("creationTimestamp"),
-        })
     return result

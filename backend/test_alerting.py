@@ -1,14 +1,15 @@
 """
 Tests for alerting.py — run from the backend/ directory:
-    pip install pytest
     pytest test_alerting.py -v
 """
 import os
 import smtplib
+import ssl
 import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock, call
 import alerting
+from settings import ConfigError
 
 
 def html_body(msg) -> str:
@@ -76,6 +77,13 @@ class TestIsConfigured:
         with patch.dict(os.environ, env, clear=False):
             assert alerting.is_configured() is False
 
+    @pytest.mark.parametrize("value", ["0.5", "abc"])
+    def test_invalid_interval_refused(self, value):
+        env = {**SMTP_ENV, "ALERT_CHECK_INTERVAL_HOURS": value}
+        with patch.dict(os.environ, env, clear=False):
+            with pytest.raises(ConfigError, match="ALERT_CHECK_INTERVAL_HOURS"):
+                alerting.get_config()
+
     def test_multiple_recipients(self):
         env = {**SMTP_ENV, "ALERT_EMAIL_TO": "a@b.com, c@d.com"}
         with patch.dict(os.environ, env, clear=False):
@@ -125,6 +133,31 @@ class TestComposeEmail:
         msg = alerting._compose_email(self._cfg(), snaps)
         assert "monitor@example.com" in msg["From"]
 
+    def test_markup_in_inventory_names_is_escaped(self):
+        snap = {**make_snap("pvc1", 10), "datastore": "<b>x</b>", "pvc_name": "<b>x</b>"}
+        body = html_body(alerting._compose_email(self._cfg(), [snap]))
+        assert "&lt;b&gt;x&lt;/b&gt;" in body
+        assert "<b>x</b>" not in body
+
+    def test_unknown_age_reported_as_unknown(self):
+        snap = {**make_snap("pvc1", 10), "created": None}
+        msg = alerting._compose_email(self._cfg(), [snap])
+        assert "unknown age" in msg["Subject"]
+        assert "unknown" in html_body(msg)
+
+
+class TestComposeOrphanEmail:
+    def _cfg(self):
+        with patch.dict(os.environ, SMTP_ENV, clear=False):
+            return alerting.get_config()
+
+    def test_markup_in_inventory_names_is_escaped(self):
+        orphan = {"fcd_id": "id-1", "fcd_name": "<b>x</b>", "datastore": "<b>x</b>",
+                  "capacity_gb": 1.0, "vm_name": "<b>x</b>"}
+        body = html_body(alerting._compose_orphan_email(self._cfg(), [orphan]))
+        assert "&lt;b&gt;x&lt;/b&gt;" in body
+        assert "<b>x</b>" not in body
+
 
 # ── _send_email ───────────────────────────────────────────────────────────────
 
@@ -154,6 +187,26 @@ class TestSendEmail:
             alerting._send_email(cfg, self._msg())
         mock_ssl.assert_called_once()
         mock_plain.assert_not_called()
+        context = mock_ssl.call_args.kwargs["context"]
+        assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
+
+    def test_starttls_uses_verifying_context(self):
+        cfg = {**self._cfg(), "smtp_port": 587, "smtp_use_tls": True}
+        mock_server = MagicMock()
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_smtp.return_value.__enter__ = lambda s: mock_server
+            mock_smtp.return_value.__exit__ = MagicMock(return_value=False)
+            alerting._send_email(cfg, self._msg())
+        context = mock_server.starttls.call_args.kwargs["context"]
+        assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
+
+    def test_credentials_never_sent_without_tls(self):
+        cfg = {**self._cfg(), "smtp_port": 587, "smtp_use_tls": False, "smtp_user": "user@example.com"}
+        with patch("smtplib.SMTP") as mock_smtp, \
+             patch.dict(os.environ, {"SMTP_PASSWORD": "secret"}, clear=False):
+            with pytest.raises(RuntimeError, match="without TLS"):
+                alerting._send_email(cfg, self._msg())
+        mock_smtp.assert_not_called()
 
     def test_login_called_when_credentials_set(self):
         cfg = {**self._cfg(), "smtp_port": 587, "smtp_use_tls": True, "smtp_user": "user@example.com"}
@@ -252,8 +305,9 @@ class TestCheckAndAlert:
             result = alerting.check_and_alert()
         assert result["sent"] is False
         assert result["reason"] == "smtp_error"
-        assert "Connection refused" in result["error"]
-        assert alerting._state["last_error"] == "Connection refused"
+        # The detail goes to the log, not to API responses.
+        assert "Connection refused" not in result["error"]
+        assert alerting._state["last_error"] == result["error"]
 
     def test_fetch_error_captured(self):
         with patch.dict(os.environ, SMTP_ENV, clear=False), \
@@ -261,7 +315,17 @@ class TestCheckAndAlert:
             result = alerting.check_and_alert()
         assert result["sent"] is False
         assert result["reason"] == "fetch_error"
-        assert "vCenter unavailable" in result["error"]
+        assert "vCenter unavailable" not in result["error"]
+        assert alerting._state["last_error"] == result["error"]
+
+    def test_snapshot_with_unknown_age_is_alerted(self):
+        snaps = [{**make_snap("pvc1", 1), "created": "not-a-date"}]
+        with patch.dict(os.environ, SMTP_ENV, clear=False), \
+             patch("vcenter_client.get_snapshots", return_value=snaps), \
+             patch("alerting._send_email") as mock_send:
+            result = alerting.check_and_alert()
+        assert result["sent"] is True and result["count"] == 1
+        mock_send.assert_called_once()
 
     def test_last_check_updated(self):
         assert alerting._state["last_check"] is None

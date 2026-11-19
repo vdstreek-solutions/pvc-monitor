@@ -2,28 +2,42 @@ import asyncio
 import logging
 import os
 import secrets
+import time
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from starlette.middleware.sessions import SessionMiddleware
+from dotenv import load_dotenv
 
-import alerting
-import auth
-import k8s_client
-import vcenter_client
+# Read backend/.env once, before any module below reads the environment.
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
+from fastapi import Depends, FastAPI, HTTPException, Request  # noqa: E402
+from fastapi.staticfiles import StaticFiles  # noqa: E402
+from starlette.middleware.base import BaseHTTPMiddleware  # noqa: E402
+from starlette.middleware.sessions import SessionMiddleware  # noqa: E402
+from starlette.middleware.trustedhost import TrustedHostMiddleware  # noqa: E402
+
+from settings import ConfigError, Unavailable, env_bool, env_list  # noqa: E402
+
+try:
+    import alerting  # noqa: E402
+    import auth  # noqa: E402
+    import k8s_client  # noqa: E402
+    import vcenter_client  # noqa: E402
+
+    auth.validate_settings()
+    alerting.get_config()
+    ENABLE_DEBUG_ENDPOINT = env_bool("ENABLE_DEBUG_ENDPOINT", False)
+    TRUSTED_HOSTS = env_list("TRUSTED_HOSTS")
+except ConfigError as exc:
+    raise SystemExit(f"Configuration error: {exc}") from None
 
 logger = logging.getLogger(__name__)
-
-# ── Session config ───────────────────────────────────────────────────────────
-
-_SESSION_SECRET = os.getenv("SESSION_SECRET", "")
-if not _SESSION_SECRET:
-    _SESSION_SECRET = secrets.token_hex(32)
-    logger.warning("SESSION_SECRET not set — using random key; sessions won't survive restarts")
-
-_SESSION_SECURE = os.getenv("SESSION_SECURE", "false").lower() == "true"
 
 
 # ── Lifespan ─────────────────────────────────────────────────────────────────
@@ -40,239 +54,235 @@ async def lifespan(app: FastAPI):
         pass
 
 
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+# The built SPA loads only its own scripts, styles and assets.
+_CSP = "default-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+
+
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("Content-Security-Policy", _CSP)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    return response
+
+
+class _TrustedHostMiddleware(TrustedHostMiddleware):
+    """TrustedHostMiddleware that leaves /healthz open: kubelet probes send the pod IP as Host."""
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"] == "/healthz":
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
+
+def _call(fn, *args):
+    """Run a backend call; return a fixed message to the client and log the detail."""
+    try:
+        return fn(*args)
+    except Unavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))  # text written by this app
+    except Exception:
+        logger.exception("%s failed", fn.__name__)
+        raise HTTPException(status_code=500, detail="Internal error, see the server log")
+
+
+# Minimum time between two forced alert e-mails of the same kind.
+ALERT_TEST_MIN_INTERVAL_SECONDS = 60
+_last_alert_test: dict[str, float] = {}
+
+
+def _alert_post_guard(kind: str):
+    async def guard(request: Request) -> None:
+        # Browsers send Sec-Fetch-Site; older ones at least send Origin on POST.
+        # Non-browser clients send neither and cannot be driven cross-site.
+        site = request.headers.get("sec-fetch-site")
+        origin = request.headers.get("origin")
+        if site is not None and site != "same-origin":
+            raise HTTPException(status_code=403, detail="Cross-site request refused")
+        if site is None and origin is not None and urlsplit(origin).netloc != request.headers.get("host"):
+            raise HTTPException(status_code=403, detail="Cross-site request refused")
+        # Runs on the event loop, so check-and-set needs no lock.
+        now = time.monotonic()
+        last = _last_alert_test.get(kind)
+        if last is not None and now - last < ALERT_TEST_MIN_INTERVAL_SECONDS:
+            wait = int(ALERT_TEST_MIN_INTERVAL_SECONDS - (now - last)) + 1
+            raise HTTPException(status_code=429, detail=f"Try again in {wait} seconds")
+        _last_alert_test[kind] = now
+    return Depends(guard)
+
+
+def _alert_response(result: dict) -> dict:
+    if result.get("reason") == "not_configured":
+        raise HTTPException(status_code=503, detail="SMTP not configured")
+    if result.get("reason") == "smtp_error":
+        raise HTTPException(status_code=502, detail=result["error"])
+    return result
+
+
+# ── Routes ───────────────────────────────────────────────────────────────────
+#
+# Handlers that call vCenter, Kubernetes or SMTP are plain `def`: FastAPI runs
+# them in its thread pool, so a slow scan does not block /healthz or others.
+
+def _register_routes(app: FastAPI) -> None:
+    @app.get("/healthz")
+    async def healthz():
+        return {"status": "ok"}
+
+    # vSphere
+    @app.get("/api/health")
+    def health():
+        return vcenter_client.check_connectivity()
+
+    @app.get("/api/persistent-volumes")
+    def persistent_volumes():
+        return _call(vcenter_client.get_persistent_volumes)
+
+    @app.get("/api/container-volumes")
+    def container_volumes():
+        return _call(vcenter_client.get_container_volumes)
+
+    @app.get("/api/snapshots")
+    def snapshots():
+        return _call(vcenter_client.get_snapshots)
+
+    @app.get("/api/orphaned-fcds")
+    def orphaned_fcds():
+        return _call(vcenter_client.get_orphaned_fcds)
+
+    # Overview (joined PVC + FCD)
+    @app.get("/api/overview")
+    def volume_overview():
+        container_vols = _call(vcenter_client.get_container_volumes)
+
+        try:
+            persistent_vols = vcenter_client.get_persistent_volumes()
+        except Exception:
+            logger.exception("overview: vSphere scan failed, showing Kubernetes data only")
+            persistent_vols = []
+
+        vsphere_by_pv = {v["pv_name"].lower(): v for v in persistent_vols}
+
+        result = []
+        for pvc in container_vols:
+            pv_name    = (pvc.get("pv_name") or "").lower()
+            vsphere    = vsphere_by_pv.get(pv_name)
+            pvc_status = pvc.get("status") or ""
+
+            if pvc_status not in ("Bound",):
+                usage_state = pvc_status.lower() if pvc_status else "unknown"
+            elif vsphere and (vsphere.get("vm_name") or "—") not in ("—", ""):
+                usage_state = "active"
+            else:
+                usage_state = "idle"
+
+            result.append({
+                "namespace":      pvc["namespace"],
+                "pvc_name":       pvc["name"],
+                "pv_name":        pvc.get("pv_name") or "—",
+                "volume_handle":  pvc.get("volume_handle") or "—",
+                "capacity":       pvc.get("capacity") or "—",
+                "pvc_status":     pvc_status,
+                "storage_class":  pvc.get("storage_class") or "—",
+                "access_modes":   pvc.get("access_modes") or [],
+                "pvc_created":    pvc.get("created"),
+                "vsphere_found":  vsphere is not None,
+                "vm_name":        (vsphere or {}).get("vm_name") or "—",
+                "vm_power_state": (vsphere or {}).get("vm_power_state") or "—",
+                "datastore":      (vsphere or {}).get("datastore") or "—",
+                "usage_state":    usage_state,
+            })
+
+        return result
+
+    # Alerts
+    @app.get("/api/alerts/status")
+    def alerts_status():
+        return alerting.get_status()
+
+    @app.post("/api/alerts/test", dependencies=[_alert_post_guard("snapshots")])
+    def alerts_test():
+        return _alert_response(_call(alerting.check_and_alert, True))
+
+    @app.post("/api/alerts/orphan-test", dependencies=[_alert_post_guard("orphans")])
+    def alerts_orphan_test():
+        return _alert_response(_call(alerting.check_and_alert_orphans, True))
+
+    # Diagnostics: lists every virtual disk visible to the vCenter account.
+    if ENABLE_DEBUG_ENDPOINT:
+        logger.warning("ENABLE_DEBUG_ENDPOINT=true, /api/debug/vsphere is available")
+
+        @app.get("/api/debug/vsphere")
+        def debug_vsphere():
+            return _call(vcenter_client.debug_vsphere_inventory)
+
+    # Kubernetes
+    @app.get("/api/k8s/health")
+    def k8s_health():
+        return k8s_client.check_k8s_connectivity()
+
+    @app.get("/api/k8s/persistent-volumes")
+    def k8s_persistent_volumes():
+        return _call(k8s_client.get_k8s_persistent_volumes)
+
+    @app.get("/api/k8s/persistent-volume-claims")
+    def k8s_persistent_volume_claims():
+        return _call(k8s_client.get_k8s_persistent_volume_claims)
+
+    @app.get("/api/k8s/volume-snapshots")
+    def k8s_volume_snapshots():
+        return _call(k8s_client.get_k8s_volume_snapshots)
+
+    @app.get("/api/k8s/volume-snapshot-contents")
+    def k8s_volume_snapshot_contents():
+        return _call(k8s_client.get_k8s_volume_snapshot_contents)
+
+
 # ── App + middleware ─────────────────────────────────────────────────────────
 #
 # Middleware is applied in LIFO order: the LAST add_middleware call becomes
 # the outermost wrapper (first to receive the request).
 #
-#   Request → SessionMiddleware → AuthMiddleware → CORSMiddleware → routes
+#   Request → security headers → TrustedHost → Session → Auth → routes
 #
-# SessionMiddleware must be outermost so AuthMiddleware can read the session.
+# SessionMiddleware must wrap AuthMiddleware so AuthMiddleware can read the session.
 
-app = FastAPI(title="vCenter Monitor", lifespan=lifespan)
+def create_app() -> FastAPI:
+    # The SPA is served from the same origin, so no CORS and no API docs pages.
+    app = FastAPI(
+        title="vCenter Monitor", lifespan=lifespan,
+        docs_url=None, redoc_url=None, openapi_url=None,
+    )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-app.add_middleware(auth.AuthMiddleware)
-app.add_middleware(
-    SessionMiddleware,
-    secret_key=_SESSION_SECRET,
-    https_only=_SESSION_SECURE,
-    same_site="lax",
-    max_age=86400 * 7,  # 7 days
-)
+    session_secret = auth.SESSION_SECRET
+    if not session_secret:  # only possible with AUTH_ENABLED=false
+        session_secret = secrets.token_hex(32)
 
-app.include_router(auth.router)
+    app.add_middleware(auth.AuthMiddleware)
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=session_secret,
+        session_cookie=auth.SESSION_COOKIE,
+        https_only=auth.SESSION_SECURE,
+        same_site="lax",
+        max_age=auth.SESSION_MAX_AGE_HOURS * 3600,
+    )
+    if TRUSTED_HOSTS:
+        app.add_middleware(_TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
+    app.add_middleware(BaseHTTPMiddleware, dispatch=_security_headers)
 
+    app.include_router(auth.router)
+    _register_routes(app)
 
-# ── Process health (liveness probe — no external calls) ─────────────────────
-
-@app.get("/healthz")
-async def healthz():
-    return {"status": "ok"}
-
-
-# ── vSphere endpoints ────────────────────────────────────────────────────────
-
-@app.get("/api/health")
-async def health():
-    return vcenter_client.check_connectivity()
-
-
-@app.get("/api/persistent-volumes")
-async def persistent_volumes():
-    try:
-        return vcenter_client.get_persistent_volumes()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    # Serve the built React app in production.
+    static_dir = os.path.join(os.path.dirname(__file__), "../frontend/dist")
+    if os.path.exists(static_dir):
+        app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
+    return app
 
 
-@app.get("/api/container-volumes")
-async def container_volumes():
-    try:
-        return vcenter_client.get_container_volumes()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/api/snapshots")
-async def snapshots():
-    try:
-        return vcenter_client.get_snapshots()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/api/orphaned-fcds")
-async def orphaned_fcds():
-    try:
-        return vcenter_client.get_orphaned_fcds()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-# ── Overview (joined PVC + FCD) ──────────────────────────────────────────────
-
-@app.get("/api/overview")
-async def volume_overview():
-    try:
-        container_vols = vcenter_client.get_container_volumes()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    try:
-        persistent_vols = vcenter_client.get_persistent_volumes()
-    except Exception:
-        persistent_vols = []
-
-    vsphere_by_pv = {v["pv_name"].lower(): v for v in persistent_vols}
-
-    result = []
-    for pvc in container_vols:
-        pv_name    = (pvc.get("pv_name") or "").lower()
-        vsphere    = vsphere_by_pv.get(pv_name)
-        pvc_status = pvc.get("status") or ""
-
-        if pvc_status not in ("Bound",):
-            usage_state = pvc_status.lower() if pvc_status else "unknown"
-        elif vsphere and (vsphere.get("vm_name") or "—") not in ("—", ""):
-            usage_state = "active"
-        else:
-            usage_state = "idle"
-
-        result.append({
-            "namespace":      pvc["namespace"],
-            "pvc_name":       pvc["name"],
-            "pv_name":        pvc.get("pv_name") or "—",
-            "volume_handle":  pvc.get("volume_handle") or "—",
-            "capacity":       pvc.get("capacity") or "—",
-            "pvc_status":     pvc_status,
-            "storage_class":  pvc.get("storage_class") or "—",
-            "access_modes":   pvc.get("access_modes") or [],
-            "pvc_created":    pvc.get("created"),
-            "vsphere_found":  vsphere is not None,
-            "vm_name":        (vsphere or {}).get("vm_name") or "—",
-            "vm_power_state": (vsphere or {}).get("vm_power_state") or "—",
-            "datastore":      (vsphere or {}).get("datastore") or "—",
-            "usage_state":    usage_state,
-        })
-
-    return result
-
-
-# ── Alert endpoints ──────────────────────────────────────────────────────────
-
-@app.get("/api/alerts/status")
-async def alerts_status():
-    return alerting.get_status()
-
-
-@app.post("/api/alerts/test")
-async def alerts_test():
-    try:
-        result = alerting.check_and_alert(force=True)
-        if result.get("reason") == "not_configured":
-            raise HTTPException(status_code=503, detail="SMTP not configured")
-        if result.get("reason") == "smtp_error":
-            raise HTTPException(status_code=502, detail=result.get("error", "SMTP error"))
-        return result
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.post("/api/alerts/orphan-test")
-async def alerts_orphan_test():
-    try:
-        result = alerting.check_and_alert_orphans(force=True)
-        if result.get("reason") == "not_configured":
-            raise HTTPException(status_code=503, detail="SMTP not configured")
-        if result.get("reason") == "smtp_error":
-            raise HTTPException(status_code=502, detail=result.get("error", "SMTP error"))
-        return result
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-# ── Diagnostic endpoint ──────────────────────────────────────────────────────
-
-@app.get("/api/debug/vsphere")
-async def debug_vsphere():
-    try:
-        return vcenter_client.debug_vsphere_inventory()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-# ── Kubernetes endpoints ─────────────────────────────────────────────────────
-
-@app.get("/api/k8s/health")
-async def k8s_health():
-    return k8s_client.check_k8s_connectivity()
-
-
-@app.get("/api/k8s/persistent-volumes")
-async def k8s_persistent_volumes():
-    try:
-        return k8s_client.get_k8s_persistent_volumes()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/api/k8s/persistent-volume-claims")
-async def k8s_persistent_volume_claims():
-    try:
-        return k8s_client.get_k8s_persistent_volume_claims()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/api/k8s/volume-snapshots")
-async def k8s_volume_snapshots():
-    try:
-        return k8s_client.get_k8s_volume_snapshots()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/api/k8s/volume-snapshot-contents")
-async def k8s_volume_snapshot_contents():
-    try:
-        return k8s_client.get_k8s_volume_snapshot_contents()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-# ── Serve built React app in production ─────────────────────────────────────
-
-_static_dir = os.path.join(os.path.dirname(__file__), "../frontend/dist")
-if os.path.exists(_static_dir):
-    app.mount("/", StaticFiles(directory=_static_dir, html=True), name="static")
+app = create_app()
