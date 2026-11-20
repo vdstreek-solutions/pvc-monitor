@@ -1,0 +1,22 @@
+# Keep secrets, local environments, caches, tests and VCS data out of the build context.
+**/.env
+**/.env.*
+!**/.env.example
+**/venv
+**/.venv*
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/node_modules
+**/dist
+**/test_*.py
+**/conftest.py
+**/tests
+.git
+.gitignore
+**/.dockerignore
+**/Dockerfile
+docker-compose.yml
+helm
+*.md
+**/.DS_Store

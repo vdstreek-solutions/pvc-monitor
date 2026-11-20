@@ -55,7 +55,8 @@ function useHealth(url) {
       try {
         const res  = await fetch(url)
         const data = await res.json()
-        setHealth({ status: data.connected ? 'connected' : 'disconnected', ...data })
+        // A 503 (for example "scan in progress") carries its text in detail.
+        setHealth({ status: data.connected ? 'connected' : 'disconnected', error: data.detail, ...data })
       } catch {
         setHealth({ status: 'disconnected', error: 'Cannot reach backend' })
       }
@@ -149,9 +150,19 @@ function UserBadge({ user }) {
     <div className="header-user">
       <span className="header-user-avatar">{initial}</span>
       <span className="header-user-name">{user.name || user.email}</span>
-      <a href="/auth/logout" className="header-signout">Sign out</a>
+      <a href="/auth/login" className="header-signout" onClick={signOut}>Sign out</a>
     </div>
   )
+}
+
+// Logout is a same-origin POST; a plain link would let other sites log users out.
+async function signOut(event) {
+  event.preventDefault()
+  try {
+    await fetch('/auth/logout', { method: 'POST', redirect: 'manual' })
+  } finally {
+    window.location.assign('/auth/login')
+  }
 }
 
 function HealthBadge({ health, label }) {

@@ -1,16 +1,31 @@
+# Local deployment: only the nginx front end is published, on loopback.
+# The backend is reachable only from nginx over the compose network.
 services:
   backend:
     build: ./backend
-    ports:
-      - "8000:8000"
     env_file:
       - ./backend/.env
+    environment:
+      # Trust X-Forwarded-* only from the nginx container (fixed address below).
+      FORWARDED_ALLOW_IPS: "172.28.10.10"
+    networks:
+      - app
     restart: unless-stopped
 
   frontend:
     build: ./frontend
     ports:
-      - "3000:80"
+      - "127.0.0.1:3000:80"
     depends_on:
       - backend
+    networks:
+      app:
+        ipv4_address: 172.28.10.10
     restart: unless-stopped
+
+networks:
+  app:
+    ipam:
+      config:
+        # Change if this range collides with a local network.
+        - subnet: 172.28.10.0/24

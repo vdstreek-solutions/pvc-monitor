@@ -1,9 +1,18 @@
-import ssl
+import functools
+import logging
 import os
 import re
+import ssl
+import threading
+import time
+from contextlib import contextmanager
+
 from pyVim.connect import SmartConnect, Disconnect
 from pyVmomi import vim
-from dotenv import load_dotenv
+
+from settings import Unavailable, env_bool, env_int, env_str
+
+logger = logging.getLogger(__name__)
 
 # Matches snapshot delta disks: basename-000001.vmdk, basename-0001.vmdk, etc.
 _SNAPSHOT_DELTA_RE = re.compile(r'-\d{4,6}\.vmdk$', re.IGNORECASE)
@@ -32,47 +41,119 @@ def _nodash(uuid: str) -> str:
     """
     return uuid.replace('-', '')
 
-load_dotenv()
 
-VCENTER_HOST = os.getenv("VCENTER_HOST", "")
-VCENTER_USER = os.getenv("VCENTER_USER", "")
-VCENTER_PASSWORD = os.getenv("VCENTER_PASSWORD", "")
-VCENTER_PORT = int(os.getenv("VCENTER_PORT", "443"))
-VCENTER_VERIFY_SSL = os.getenv("VCENTER_VERIFY_SSL", "false").lower() == "true"
+VCENTER_HOST = env_str("VCENTER_HOST")
+VCENTER_USER = env_str("VCENTER_USER")
+VCENTER_PASSWORD = os.getenv("VCENTER_PASSWORD", "")  # used as given
+VCENTER_PORT = env_int("VCENTER_PORT", 443, minimum=1)
+VCENTER_VERIFY_SSL = env_bool("VCENTER_VERIFY_SSL", True)
+VCENTER_CA_FILE = env_str("VCENTER_CA_FILE") or None  # PEM bundle for a private vCenter CA
+# How long a finished vCenter scan is reused by later callers.
+VCENTER_CACHE_SECONDS = env_int("VCENTER_CACHE_SECONDS", 60, minimum=0)
+# Socket timeout for each request to vCenter.
+VCENTER_TIMEOUT_SECONDS = 60
+# How long a caller waits for a running scan before it gets "scan in progress".
+VCENTER_SCAN_WAIT_SECONDS = env_int("VCENTER_SCAN_WAIT_SECONDS", 120, minimum=1)
+
+if not VCENTER_VERIFY_SSL:
+    logger.warning(
+        "vCenter: VCENTER_VERIFY_SSL=false, the vCenter certificate is NOT verified "
+        "and the service-account password can be intercepted"
+    )
+
+
+def _ssl_context() -> ssl.SSLContext:
+    # create_default_context: certificate required, hostname checked, system
+    # trust store (or VCENTER_CA_FILE when set).
+    context = ssl.create_default_context(cafile=VCENTER_CA_FILE)
+    if not VCENTER_VERIFY_SSL:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return context
 
 
 def _get_connection():
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    context.check_hostname = False
-    if not VCENTER_VERIFY_SSL:
-        context.verify_mode = ssl.CERT_NONE
+    if not VCENTER_HOST:
+        raise Unavailable("vCenter is not configured")
     return SmartConnect(
         host=VCENTER_HOST,
         user=VCENTER_USER,
         pwd=VCENTER_PASSWORD,
         port=VCENTER_PORT,
-        sslContext=context,
+        sslContext=_ssl_context(),
+        httpConnectionTimeout=VCENTER_TIMEOUT_SECONDS,
     )
 
 
+@contextmanager
+def _session():
+    """A logged-in vCenter session that is always logged out afterwards."""
+    si = _get_connection()
+    try:
+        yield si
+    finally:
+        try:
+            Disconnect(si)
+        except Exception:
+            logger.warning("vCenter: logout failed", exc_info=True)
+
+
+@contextmanager
+def _container_view(content, obj_type):
+    """Objects of one type under rootFolder; the view is always destroyed."""
+    view = content.viewManager.CreateContainerView(content.rootFolder, [obj_type], True)
+    try:
+        yield view.view
+    finally:
+        try:
+            view.Destroy()
+        except Exception:
+            pass
+
+
+# At most one vCenter call runs at a time; callers that waited for it get the
+# result of the call that just finished instead of starting another one.
+# One process-wide lock keeps this simple; use per-call locks if scans must overlap.
+_scan_lock = threading.Lock()
+_scan_cache: dict = {}
+
+
+def _single_flight(fn):
+    @functools.wraps(fn)
+    def wrapper():
+        # Waiting is bounded so request threads do not pile up behind a slow scan.
+        if not _scan_lock.acquire(timeout=VCENTER_SCAN_WAIT_SECONDS):
+            raise Unavailable("A vCenter scan is in progress; try again in a minute")
+        try:
+            hit = _scan_cache.get(fn.__name__)
+            if hit and time.monotonic() - hit[0] < VCENTER_CACHE_SECONDS:
+                return hit[1]
+            result = fn()  # failures are not cached
+            _scan_cache[fn.__name__] = (time.monotonic(), result)
+            return result
+        finally:
+            _scan_lock.release()
+    return wrapper
+
+
+@_single_flight
 def check_connectivity() -> dict:
     try:
-        si = _get_connection()
-        about = si.RetrieveContent().about
-        Disconnect(si)
-        return {
-            "connected": True,
-            "vcenter_host": VCENTER_HOST,
-            "version": about.version,
-            "build": about.build,
-            "full_name": about.fullName,
-        }
-    except Exception as exc:
-        return {
-            "connected": False,
-            "vcenter_host": VCENTER_HOST,
-            "error": str(exc),
-        }
+        with _session() as si:
+            about = si.RetrieveContent().about
+            return {
+                "connected": True,
+                "vcenter_host": VCENTER_HOST,
+                "version": about.version,
+                "build": about.build,
+                "full_name": about.fullName,
+            }
+    except Unavailable as exc:
+        error = str(exc)
+    except Exception:
+        logger.exception("vCenter: connectivity check failed")
+        error = "connection failed, see the server log"
+    return {"connected": False, "vcenter_host": VCENTER_HOST, "error": error}
 
 
 VSPHERE_CSI_DRIVER = "csi.vsphere.vmware.com"
@@ -142,39 +223,36 @@ def _build_vm_attachment_index(content) -> tuple[dict, dict]:
     obj_id_index: dict = {}
     filepath_index: dict = {}
     try:
-        vm_view = content.viewManager.CreateContainerView(
-            content.rootFolder, [vim.VirtualMachine], True
-        )
-        for vm in vm_view.view:
-            try:
-                if not vm.config:
-                    continue
-                for device in vm.config.hardware.device:
-                    if not isinstance(device, vim.vm.device.VirtualDisk):
+        with _container_view(content, vim.VirtualMachine) as vm_view:
+            for vm in vm_view:
+                try:
+                    if not vm.config:
                         continue
-                    backing = device.backing
-                    ds_ref = getattr(backing, "datastore", None)
-                    vm_info = {
-                        "vm_name": vm.name,
-                        "vm_power_state": str(vm.runtime.powerState),
-                        "file_path": getattr(backing, "fileName", "") or "N/A",
-                        "datastore": ds_ref.name if ds_ref else "N/A",
-                        "capacity_gb": round(device.capacityInKB / 1024 / 1024, 2),
-                    }
-                    obj_id = (getattr(backing, "backingObjectId", None) or "").lower()
-                    if obj_id:
-                        obj_id_index[obj_id] = vm_info
-                    fp = (getattr(backing, "fileName", None) or "").lower()
-                    if fp:
-                        filepath_index[fp] = vm_info
-                        # When the active disk is a snapshot delta, also index
-                        # by the base path so the FCD catalog lookup still hits.
-                        base = _delta_to_base(fp)
-                        if base:
-                            filepath_index[base] = vm_info
-            except Exception:
-                continue
-        vm_view.Destroy()
+                    for device in vm.config.hardware.device:
+                        if not isinstance(device, vim.vm.device.VirtualDisk):
+                            continue
+                        backing = device.backing
+                        ds_ref = getattr(backing, "datastore", None)
+                        vm_info = {
+                            "vm_name": vm.name,
+                            "vm_power_state": str(vm.runtime.powerState),
+                            "file_path": getattr(backing, "fileName", "") or "N/A",
+                            "datastore": ds_ref.name if ds_ref else "N/A",
+                            "capacity_gb": round(device.capacityInKB / 1024 / 1024, 2),
+                        }
+                        obj_id = (getattr(backing, "backingObjectId", None) or "").lower()
+                        if obj_id:
+                            obj_id_index[obj_id] = vm_info
+                        fp = (getattr(backing, "fileName", None) or "").lower()
+                        if fp:
+                            filepath_index[fp] = vm_info
+                            # When the active disk is a snapshot delta, also index
+                            # by the base path so the FCD catalog lookup still hits.
+                            base = _delta_to_base(fp)
+                            if base:
+                                filepath_index[base] = vm_info
+                except Exception:
+                    continue
     except Exception:
         pass
     return obj_id_index, filepath_index
@@ -190,90 +268,84 @@ def _scan_fcd_catalog(content, term_to_pv: dict, handle_to_pv: dict,
       3. FCD UUID         == volumeHandle
 
     Annotates each result with attached node VM data from the index.
-    Skips datastores where the account lacks System.View / StorageViews.View.
+    Skips datastores where the account lacks Datastore.FileManagement, which
+    ListVStorageObject and RetrieveVStorageObject require.
     """
     volumes: list = []
     try:
         vsom = content.vStorageObjectManager
-        ds_view = content.viewManager.CreateContainerView(
-            content.rootFolder, [vim.Datastore], True
-        )
-        for ds in ds_view.view:
-            ds_id = _ds_label(ds)
-            try:
-                refs = vsom.ListVStorageObject(ds)
-            except Exception:
-                continue
-            for ref in refs:
+        with _container_view(content, vim.Datastore) as ds_view:
+            for ds in ds_view:
+                ds_id = _ds_label(ds)
                 try:
-                    obj = vsom.RetrieveVStorageObject(ref, ds)
-                    cfg = obj.config
-                    fcd_name = (getattr(cfg, "name", None) or "").lower()
-                    fcd_id = (cfg.id.id or "").lower()
-
-                    pv = term_to_pv.get(fcd_name) or handle_to_pv.get(fcd_id)
-                    if not pv:
-                        continue
-
-                    key = _pv_key(pv)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-
-                    fcd_backing = getattr(cfg, "backing", None)
-                    fcd_file_path = (
-                        getattr(fcd_backing, "filePath", "") if fcd_backing else ""
-                    ) or ""
-
-                    vm_info = (
-                        obj_id_index.get(fcd_id)
-                        or obj_id_index.get(_nodash(fcd_id))
-                        or filepath_index.get(fcd_file_path.lower())
-                    )
-
-                    volumes.append({
-                        "volume_id": pv.get("volume_handle") or cfg.id.id,
-                        "pv_name": pv["name"],
-                        "claim": pv.get("claim_ref") or "—",
-                        "capacity_gb": (
-                            (vm_info or {}).get("capacity_gb")
-                            or round(getattr(cfg, "capacityInMB", 0) / 1024, 2)
-                        ),
-                        "datastore": (vm_info or {}).get("datastore") or ds_id,
-                        "file_path": (vm_info or {}).get("file_path") or fcd_file_path or "N/A",
-                        "vm_name": (vm_info or {}).get("vm_name") or "—",
-                        "vm_power_state": (vm_info or {}).get("vm_power_state") or "—",
-                        "storage_class": pv.get("storage_class") or "—",
-                        "k8s_status": pv.get("status") or "—",
-                    })
+                    refs = vsom.ListVStorageObject(ds)
                 except Exception:
                     continue
-        try:
-            ds_view.Destroy()
-        except Exception:
-            pass
+                for ref in refs:
+                    try:
+                        obj = vsom.RetrieveVStorageObject(ref, ds)
+                        cfg = obj.config
+                        fcd_name = (getattr(cfg, "name", None) or "").lower()
+                        fcd_id = (cfg.id.id or "").lower()
+
+                        pv = term_to_pv.get(fcd_name) or handle_to_pv.get(fcd_id)
+                        if not pv:
+                            continue
+
+                        key = _pv_key(pv)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+
+                        fcd_backing = getattr(cfg, "backing", None)
+                        fcd_file_path = (
+                            getattr(fcd_backing, "filePath", "") if fcd_backing else ""
+                        ) or ""
+
+                        vm_info = (
+                            obj_id_index.get(fcd_id)
+                            or obj_id_index.get(_nodash(fcd_id))
+                            or filepath_index.get(fcd_file_path.lower())
+                        )
+
+                        volumes.append({
+                            "volume_id": pv.get("volume_handle") or cfg.id.id,
+                            "pv_name": pv["name"],
+                            "claim": pv.get("claim_ref") or "—",
+                            "capacity_gb": (
+                                (vm_info or {}).get("capacity_gb")
+                                or round(getattr(cfg, "capacityInMB", 0) / 1024, 2)
+                            ),
+                            "datastore": (vm_info or {}).get("datastore") or ds_id,
+                            "file_path": (vm_info or {}).get("file_path") or fcd_file_path or "N/A",
+                            "vm_name": (vm_info or {}).get("vm_name") or "—",
+                            "vm_power_state": (vm_info or {}).get("vm_power_state") or "—",
+                            "storage_class": pv.get("storage_class") or "—",
+                            "k8s_status": pv.get("status") or "—",
+                        })
+                    except Exception:
+                        continue
     except Exception:
         pass
     return volumes
 
 
+@_single_flight
 def get_persistent_volumes() -> list[dict]:
     term_to_pv, handle_to_pv = _get_vsphere_pv_maps()
     if not term_to_pv:
         return []
 
-    si = _get_connection()
-    try:
+    with _session() as si:
         content = si.RetrieveContent()
         obj_id_index, filepath_index = _build_vm_attachment_index(content)
         return _scan_fcd_catalog(
             content, term_to_pv, handle_to_pv,
             set(), obj_id_index, filepath_index,
         )
-    finally:
-        Disconnect(si)
 
 
+@_single_flight
 def debug_vsphere_inventory() -> dict:
     """
     Diagnostic: all VMDKs on VMs, all accessible FCDs, and K8s PV search terms.
@@ -294,32 +366,28 @@ def debug_vsphere_inventory() -> dict:
             "status": p.get("status"),
         })
 
-    si = _get_connection()
-    try:
+    with _session() as si:
         content = si.RetrieveContent()
 
         all_vmdks = []
         try:
-            vm_view = content.viewManager.CreateContainerView(
-                content.rootFolder, [vim.VirtualMachine], True
-            )
-            for vm in vm_view.view:
-                try:
-                    if not vm.config:
-                        continue
-                    for device in vm.config.hardware.device:
-                        if not isinstance(device, vim.vm.device.VirtualDisk):
+            with _container_view(content, vim.VirtualMachine) as vm_view:
+                for vm in vm_view:
+                    try:
+                        if not vm.config:
                             continue
-                        all_vmdks.append({
-                            "vm": vm.name,
-                            "label": device.deviceInfo.label,
-                            "file_path": getattr(device.backing, "fileName", ""),
-                            "backing_obj_id": getattr(device.backing, "backingObjectId", None),
-                            "capacity_gb": round(device.capacityInKB / 1024 / 1024, 2),
-                        })
-                except Exception:
-                    continue
-            vm_view.Destroy()
+                        for device in vm.config.hardware.device:
+                            if not isinstance(device, vim.vm.device.VirtualDisk):
+                                continue
+                            all_vmdks.append({
+                                "vm": vm.name,
+                                "label": device.deviceInfo.label,
+                                "file_path": getattr(device.backing, "fileName", ""),
+                                "backing_obj_id": getattr(device.backing, "backingObjectId", None),
+                                "capacity_gb": round(device.capacityInKB / 1024 / 1024, 2),
+                            })
+                    except Exception:
+                        continue
         except Exception:
             pass
 
@@ -327,36 +395,30 @@ def debug_vsphere_inventory() -> dict:
         fcd_errors = []
         try:
             vsom = content.vStorageObjectManager
-            ds_view = content.viewManager.CreateContainerView(
-                content.rootFolder, [vim.Datastore], True
-            )
-            for ds in ds_view.view:
-                ds_id = _ds_label(ds)
-                try:
-                    refs = vsom.ListVStorageObject(ds)
-                except Exception as e:
-                    fcd_errors.append(f"ListVStorageObject on {ds_id}: {type(e).__name__}")
-                    continue
-                for ref in refs:
+            with _container_view(content, vim.Datastore) as ds_view:
+                for ds in ds_view:
+                    ds_id = _ds_label(ds)
                     try:
-                        obj = vsom.RetrieveVStorageObject(ref, ds)
-                        cfg = obj.config
-                        backing = getattr(cfg, "backing", None)
-                        all_fcds.append({
-                            "fcd_id": cfg.id.id,
-                            "fcd_name": getattr(cfg, "name", None),
-                            "datastore": ds_id,
-                            "capacity_mb": getattr(cfg, "capacityInMB", 0),
-                            "file_path": getattr(backing, "filePath", None) if backing else None,
-                        })
+                        refs = vsom.ListVStorageObject(ds)
                     except Exception as e:
-                        fcd_errors.append(f"RetrieveVStorageObject on {ds_id}: {type(e).__name__}")
-            try:
-                ds_view.Destroy()
-            except Exception:
-                pass
+                        fcd_errors.append(f"ListVStorageObject on {ds_id}: {type(e).__name__}")
+                        continue
+                    for ref in refs:
+                        try:
+                            obj = vsom.RetrieveVStorageObject(ref, ds)
+                            cfg = obj.config
+                            backing = getattr(cfg, "backing", None)
+                            all_fcds.append({
+                                "fcd_id": cfg.id.id,
+                                "fcd_name": getattr(cfg, "name", None),
+                                "datastore": ds_id,
+                                "capacity_mb": getattr(cfg, "capacityInMB", 0),
+                                "file_path": getattr(backing, "filePath", None) if backing else None,
+                            })
+                        except Exception as e:
+                            fcd_errors.append(f"RetrieveVStorageObject on {ds_id}: {type(e).__name__}")
         except Exception as e:
-            fcd_errors.append(f"vStorageObjectManager: {type(e).__name__}: {e}")
+            fcd_errors.append(f"vStorageObjectManager: {type(e).__name__}")
 
         return {
             "k8s_vsphere_pvs": vsphere_pvs,
@@ -364,10 +426,9 @@ def debug_vsphere_inventory() -> dict:
             "vsphere_fcds": all_fcds,
             "fcd_errors": fcd_errors,
         }
-    finally:
-        Disconnect(si)
 
 
+@_single_flight
 def get_snapshots() -> list[dict]:
     """
     Return FCD-level snapshots for vSphere CSI volumes.
@@ -385,75 +446,67 @@ def get_snapshots() -> list[dict]:
 
     search_terms = set(term_to_pv.keys())
 
-    si = _get_connection()
-    try:
+    with _session() as si:
         content = si.RetrieveContent()
         all_snapshots = []
         try:
             vsom = content.vStorageObjectManager
-            ds_view = content.viewManager.CreateContainerView(
-                content.rootFolder, [vim.Datastore], True
-            )
-            for ds in ds_view.view:
-                ds_id = _ds_label(ds)
-                try:
-                    refs = vsom.ListVStorageObject(ds)
-                except Exception:
-                    continue
-                for ref in refs:
+            with _container_view(content, vim.Datastore) as ds_view:
+                for ds in ds_view:
+                    ds_id = _ds_label(ds)
                     try:
-                        obj = vsom.RetrieveVStorageObject(ref, ds)
-                        cfg = obj.config
-                        fcd_name = (getattr(cfg, "name", None) or "").lower()
-                        fcd_id   = (cfg.id.id or "").lower()
-
-                        pv = term_to_pv.get(fcd_name) or handle_to_pv.get(fcd_id)
-                        if not pv:
-                            continue
-
-                        # Query FCD-level snapshots
-                        try:
-                            snap_info = vsom.RetrieveSnapshotInfo(ref, ds)
-                        except Exception:
-                            continue
-                        if not snap_info or not getattr(snap_info, "snapshots", None):
-                            continue
-
-                        claim_ref = pv.get("claim_ref") or ""
-                        pvc_name  = claim_ref.split("/")[-1] if "/" in claim_ref else claim_ref
-
-                        for snap in snap_info.snapshots:
-                            try:
-                                snap_id = snap.id.id if hasattr(snap.id, "id") else str(snap.id)
-                            except Exception:
-                                snap_id = "—"
-                            try:
-                                created = snap.createTime.isoformat() if getattr(snap, "createTime", None) else None
-                            except Exception:
-                                created = None
-                            all_snapshots.append({
-                                "pv_name":       pv["name"],
-                                "pvc_name":      pvc_name or "—",
-                                "volume_handle": pv.get("volume_handle") or "—",
-                                "snapshot_id":   snap_id,
-                                "description":   getattr(snap, "description", "") or "",
-                                "created":       created,
-                                "datastore":     ds_id,
-                                "storage_class": pv.get("storage_class") or "—",
-                            })
+                        refs = vsom.ListVStorageObject(ds)
                     except Exception:
                         continue
-            try:
-                ds_view.Destroy()
-            except Exception:
-                pass
+                    for ref in refs:
+                        try:
+                            obj = vsom.RetrieveVStorageObject(ref, ds)
+                            cfg = obj.config
+                            fcd_name = (getattr(cfg, "name", None) or "").lower()
+                            fcd_id   = (cfg.id.id or "").lower()
+
+                            pv = term_to_pv.get(fcd_name) or handle_to_pv.get(fcd_id)
+                            if not pv:
+                                continue
+
+                            # Query FCD-level snapshots
+                            try:
+                                snap_info = vsom.RetrieveSnapshotInfo(ref, ds)
+                            except Exception:
+                                continue
+                            if not snap_info or not getattr(snap_info, "snapshots", None):
+                                continue
+
+                            claim_ref = pv.get("claim_ref") or ""
+                            pvc_name  = claim_ref.split("/")[-1] if "/" in claim_ref else claim_ref
+
+                            for snap in snap_info.snapshots:
+                                try:
+                                    snap_id = snap.id.id if hasattr(snap.id, "id") else str(snap.id)
+                                except Exception:
+                                    snap_id = "—"
+                                try:
+                                    created = snap.createTime.isoformat() if getattr(snap, "createTime", None) else None
+                                except Exception:
+                                    created = None
+                                all_snapshots.append({
+                                    "pv_name":       pv["name"],
+                                    "pvc_name":      pvc_name or "—",
+                                    "volume_handle": pv.get("volume_handle") or "—",
+                                    "snapshot_id":   snap_id,
+                                    "description":   getattr(snap, "description", "") or "",
+                                    "created":       created,
+                                    "datastore":     ds_id,
+                                    "storage_class": pv.get("storage_class") or "—",
+                                })
+                        except Exception:
+                            continue
         except Exception:
             pass
         return all_snapshots
-    finally:
-        Disconnect(si)
 
 
+@_single_flight
 def get_orphaned_fcds() -> list[dict]:
     """
     FCDs in the vSphere catalog that have no corresponding Kubernetes PV.
@@ -476,69 +529,60 @@ def get_orphaned_fcds() -> list[dict]:
         if pv.get("driver") == VSPHERE_CSI_DRIVER and pv.get("volume_handle")
     }
 
-    si = _get_connection()
-    try:
+    with _session() as si:
         content = si.RetrieveContent()
         obj_id_index, filepath_index = _build_vm_attachment_index(content)
 
         orphans: list[dict] = []
         try:
             vsom = content.vStorageObjectManager
-            ds_view = content.viewManager.CreateContainerView(
-                content.rootFolder, [vim.Datastore], True
-            )
-            for ds in ds_view.view:
-                ds_id = _ds_label(ds)
-                try:
-                    refs = vsom.ListVStorageObject(ds)
-                except Exception:
-                    continue
-                for ref in refs:
+            with _container_view(content, vim.Datastore) as ds_view:
+                for ds in ds_view:
+                    ds_id = _ds_label(ds)
                     try:
-                        obj = vsom.RetrieveVStorageObject(ref, ds)
-                        cfg = obj.config
-                        fcd_id = (cfg.id.id or "").lower()
-
-                        if fcd_id in claimed:
-                            continue  # claimed by a K8s PV — not orphaned
-
-                        fcd_backing  = getattr(cfg, "backing", None)
-                        fcd_file_path = (
-                            getattr(fcd_backing, "filePath", "") if fcd_backing else ""
-                        ) or ""
-
-                        vm_info = (
-                            obj_id_index.get(fcd_id)
-                            or obj_id_index.get(_nodash(fcd_id))
-                            or filepath_index.get(fcd_file_path.lower())
-                        )
-
-                        try:
-                            ds_name = ds.name
-                        except Exception:
-                            ds_name = ds_id
-
-                        orphans.append({
-                            "fcd_id":        cfg.id.id,
-                            "fcd_name":      getattr(cfg, "name", "") or "—",
-                            "datastore":     ds_name,
-                            "capacity_gb":   round(getattr(cfg, "capacityInMB", 0) / 1024, 2),
-                            "file_path":     fcd_file_path or "—",
-                            "vm_name":       (vm_info or {}).get("vm_name") or "—",
-                            "vm_power_state": (vm_info or {}).get("vm_power_state") or "—",
-                        })
+                        refs = vsom.ListVStorageObject(ds)
                     except Exception:
                         continue
-            try:
-                ds_view.Destroy()
-            except Exception:
-                pass
+                    for ref in refs:
+                        try:
+                            obj = vsom.RetrieveVStorageObject(ref, ds)
+                            cfg = obj.config
+                            fcd_id = (cfg.id.id or "").lower()
+
+                            if fcd_id in claimed:
+                                continue  # claimed by a K8s PV — not orphaned
+
+                            fcd_backing  = getattr(cfg, "backing", None)
+                            fcd_file_path = (
+                                getattr(fcd_backing, "filePath", "") if fcd_backing else ""
+                            ) or ""
+
+                            vm_info = (
+                                obj_id_index.get(fcd_id)
+                                or obj_id_index.get(_nodash(fcd_id))
+                                or filepath_index.get(fcd_file_path.lower())
+                            )
+
+                            try:
+                                ds_name = ds.name
+                            except Exception:
+                                ds_name = ds_id
+
+                            orphans.append({
+                                "fcd_id":        cfg.id.id,
+                                "fcd_name":      getattr(cfg, "name", "") or "—",
+                                "datastore":     ds_name,
+                                "capacity_gb":   round(getattr(cfg, "capacityInMB", 0) / 1024, 2),
+                                "file_path":     fcd_file_path or "—",
+                                "vm_name":       (vm_info or {}).get("vm_name") or "—",
+                                "vm_power_state": (vm_info or {}).get("vm_power_state") or "—",
+                            })
+                        except Exception:
+                            continue
         except Exception:
             pass
 
         return orphans
-    finally:
-        Disconnect(si)
 
 
 def get_container_volumes() -> list[dict]:

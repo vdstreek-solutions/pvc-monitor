@@ -1,3 +1,4 @@
+{{- include "pvc-monitor.validate" . }}
 {{- if and .Values.gateway.enabled .Values.certificate.enabled }}
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -11,5 +12,7 @@ spec:
   dnsNames:
     - {{ .Values.gateway.hostname | quote }}
   issuerRef:
-    {{- toYaml .Values.certificate.issuerRef | nindent 4 }}
+    name: {{ required "certificate.issuerRef.name is required (or set certificate.enabled=false)" .Values.certificate.issuerRef.name }}
+    kind: {{ .Values.certificate.issuerRef.kind }}
+    group: {{ .Values.certificate.issuerRef.group }}
 {{- end }}

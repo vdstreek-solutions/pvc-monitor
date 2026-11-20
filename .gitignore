@@ -1,0 +1,24 @@
+# Python
+venv/
+.venv/
+.venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Node / build output
+node_modules/
+frontend/dist/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db

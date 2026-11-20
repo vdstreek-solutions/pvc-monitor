@@ -1,10 +1,15 @@
+import asyncio
+import html
+import logging
 import os
 import smtplib
-import asyncio
-import logging
+import ssl
+import threading
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+
+from settings import env_bool, env_float, env_int, env_list, env_str
 
 logger = logging.getLogger(__name__)
 
@@ -12,15 +17,16 @@ logger = logging.getLogger(__name__)
 # ── Config ───────────────────────────────────────────────────────────────────
 
 def get_config() -> dict:
+    """Read the alert settings; raises settings.ConfigError on an invalid value."""
     return {
-        "smtp_host":            os.getenv("SMTP_HOST", ""),
-        "smtp_port":            int(os.getenv("SMTP_PORT", "587")),
-        "smtp_user":            os.getenv("SMTP_USER", ""),
-        "smtp_use_tls":         os.getenv("SMTP_USE_TLS", "true").lower() != "false",
-        "smtp_from":            os.getenv("SMTP_FROM", ""),
-        "alert_to":             [a.strip() for a in os.getenv("ALERT_EMAIL_TO", "").split(",") if a.strip()],
-        "age_threshold_days":   int(os.getenv("ALERT_SNAPSHOT_AGE_DAYS", "7")),
-        "check_interval_hours": float(os.getenv("ALERT_CHECK_INTERVAL_HOURS", "24")),
+        "smtp_host":            env_str("SMTP_HOST"),
+        "smtp_port":            env_int("SMTP_PORT", 587, minimum=1),
+        "smtp_user":            env_str("SMTP_USER"),
+        "smtp_use_tls":         env_bool("SMTP_USE_TLS", True),
+        "smtp_from":            env_str("SMTP_FROM"),
+        "alert_to":             env_list("ALERT_EMAIL_TO"),
+        "age_threshold_days":   env_int("ALERT_SNAPSHOT_AGE_DAYS", 7, minimum=0),
+        "check_interval_hours": env_float("ALERT_CHECK_INTERVAL_HOURS", 24, minimum=1),
     }
 
 def is_configured(cfg: dict | None = None) -> bool:
@@ -28,7 +34,17 @@ def is_configured(cfg: dict | None = None) -> bool:
     return bool(cfg["smtp_host"] and cfg["alert_to"] and cfg["smtp_from"])
 
 
+# Fixed texts for state and API responses; the detail goes to the server log.
+_FETCH_ERROR = "inventory query failed, see the server log"
+_SMTP_ERROR  = "sending the e-mail failed, see the server log"
+
+
 # ── In-memory state ──────────────────────────────────────────────────────────
+#
+# Written by the scheduler thread and by request threads (test alerts, status),
+# so every access goes through _state_lock.
+
+_state_lock = threading.Lock()
 
 _state: dict = {
     "last_check": None,  # datetime
@@ -44,8 +60,19 @@ _state_orphans: dict = {
     "last_error": None,
 }
 
+
+def _update(state: dict, **values) -> None:
+    with _state_lock:
+        state.update(values)
+
+
 def get_status() -> dict:
     cfg = get_config()
+    with _state_lock:
+        return _status(cfg)
+
+
+def _status(cfg: dict) -> dict:
     return {
         # Snapshot alert fields (unchanged — Snapshots.jsx reads these top-level)
         "configured":           is_configured(cfg),
@@ -77,37 +104,52 @@ def _age_days(iso: str | None) -> int | None:
         return None
 
 
+def _e(value) -> str:
+    """HTML-escape one value for the alert e-mails; empty values become a dash."""
+    if value is None or value == "":
+        return "—"
+    return html.escape(str(value))
+
+
 def _compose_email(cfg: dict, old_snaps: list[dict], test: bool = False) -> MIMEMultipart:
     threshold = cfg["age_threshold_days"]
     count = len(old_snaps)
+    unknown = sum(1 for s in old_snaps if _age_days(s.get("created")) is None)
 
     if test and count == 0:
         subject = "[PVC Monitor] Test alert — no old snapshots currently"
         intro = f"This is a test email from PVC Monitor. There are currently <strong>no snapshots older than {threshold} days</strong>."
     else:
         subject = f"[PVC Monitor] {count} snapshot{'s' if count != 1 else ''} older than {threshold} days"
+        if unknown:
+            subject += " or of unknown age"
         intro = (
             f"<strong>{count} FCD snapshot{'s' if count != 1 else ''}</strong> "
             f"{'are' if count != 1 else 'is'} older than <strong>{threshold} days</strong> "
             f"and may need to be cleaned up."
         )
+        if unknown:
+            intro += (
+                f" {unknown} of {'them have' if unknown != 1 else 'them has'} no readable "
+                "creation time; their age is <strong>unknown</strong>."
+            )
 
     rows = ""
-    for s in sorted(old_snaps, key=lambda x: x.get("created") or ""):
+    for s in sorted(old_snaps, key=lambda x: str(x.get("created") or "")):
         age = _age_days(s.get("created"))
-        age_str = f"{age}d" if age is not None else "?"
-        age_color = "#c0392b" if (age or 0) > 30 else "#e67e22" if (age or 0) > 7 else "#333"
-        created = s.get("created") or "—"
+        age_str = f"{age}d" if age is not None else "unknown"
+        age_color = "#e67e22" if age is None else "#c0392b" if age > 30 else "#e67e22" if age > 7 else "#333"
+        created = str(s.get("created") or "—")
         created_short = created[:10] if len(created) >= 10 else created
         rows += f"""
         <tr>
-          <td style="padding:7px 12px;border-bottom:1px solid #eee">{s.get('pvc_name') or '—'}</td>
-          <td style="padding:7px 12px;border-bottom:1px solid #eee;font-size:12px;font-family:monospace">{s.get('pv_name') or '—'}</td>
-          <td style="padding:7px 12px;border-bottom:1px solid #eee;font-size:11px;font-family:monospace">{s.get('snapshot_id') or '—'}</td>
-          <td style="padding:7px 12px;border-bottom:1px solid #eee">{s.get('datastore') or '—'}</td>
-          <td style="padding:7px 12px;border-bottom:1px solid #eee">{s.get('storage_class') or '—'}</td>
-          <td style="padding:7px 12px;border-bottom:1px solid #eee">{created_short}</td>
-          <td style="padding:7px 12px;border-bottom:1px solid #eee;font-weight:700;color:{age_color}">{age_str}</td>
+          <td style="padding:7px 12px;border-bottom:1px solid #eee">{_e(s.get('pvc_name'))}</td>
+          <td style="padding:7px 12px;border-bottom:1px solid #eee;font-size:12px;font-family:monospace">{_e(s.get('pv_name'))}</td>
+          <td style="padding:7px 12px;border-bottom:1px solid #eee;font-size:11px;font-family:monospace">{_e(s.get('snapshot_id'))}</td>
+          <td style="padding:7px 12px;border-bottom:1px solid #eee">{_e(s.get('datastore'))}</td>
+          <td style="padding:7px 12px;border-bottom:1px solid #eee">{_e(s.get('storage_class'))}</td>
+          <td style="padding:7px 12px;border-bottom:1px solid #eee">{_e(created_short)}</td>
+          <td style="padding:7px 12px;border-bottom:1px solid #eee;font-weight:700;color:{age_color}">{_e(age_str)}</td>
         </tr>"""
 
     table_section = ""
@@ -139,7 +181,7 @@ def _compose_email(cfg: dict, old_snaps: list[dict], test: bool = False) -> MIME
     {table_section}
     <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
     <p style="margin:0;font-size:11px;color:#aaa">
-      Sent by PVC Monitor &nbsp;·&nbsp; threshold: {threshold} days
+      Sent by PVC Monitor &nbsp;·&nbsp; threshold: {_e(threshold)} days
       &nbsp;·&nbsp; {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
     </p>
   </div>
@@ -162,9 +204,13 @@ def _send_email(cfg: dict, msg: MIMEMultipart) -> None:
     user     = cfg["smtp_user"]
     password = os.getenv("SMTP_PASSWORD", "")
     use_tls  = cfg["smtp_use_tls"]
+    context  = ssl.create_default_context()  # verifies certificate chain and hostname
+
+    if user and password and port != 465 and not use_tls:
+        raise RuntimeError("refusing to send SMTP credentials without TLS (SMTP_USE_TLS=false)")
 
     if port == 465:
-        with smtplib.SMTP_SSL(host, port, timeout=15) as server:
+        with smtplib.SMTP_SSL(host, port, timeout=15, context=context) as server:
             if user and password:
                 server.login(user, password)
             server.sendmail(cfg["smtp_from"], cfg["alert_to"], msg.as_string())
@@ -172,7 +218,7 @@ def _send_email(cfg: dict, msg: MIMEMultipart) -> None:
         with smtplib.SMTP(host, port, timeout=15) as server:
             server.ehlo()
             if use_tls:
-                server.starttls()
+                server.starttls(context=context)
                 server.ehlo()
             if user and password:
                 server.login(user, password)
@@ -189,25 +235,26 @@ def check_and_alert(force: bool = False) -> dict:
     import vcenter_client  # late import — avoids circular dependency at module load
 
     cfg = get_config()
-    _state["last_check"] = datetime.now(timezone.utc)
-    _state["last_error"] = None
+    _update(_state, last_check=datetime.now(timezone.utc), last_error=None)
 
     if not is_configured(cfg):
-        _state["last_error"] = "SMTP not configured"
+        _update(_state, last_error="SMTP not configured")
         return {"sent": False, "reason": "not_configured", "count": 0}
 
     try:
         snapshots = vcenter_client.get_snapshots()
-    except Exception as exc:
-        _state["last_error"] = str(exc)
-        return {"sent": False, "reason": "fetch_error", "error": str(exc), "count": 0}
+    except Exception:
+        logger.exception("Alerting: snapshots, vCenter query failed")
+        _update(_state, last_error=_FETCH_ERROR)
+        return {"sent": False, "reason": "fetch_error", "error": _FETCH_ERROR, "count": 0}
 
+    # A snapshot without a readable creation time is reported, not skipped.
     threshold = cfg["age_threshold_days"]
     old_snaps = [
         s for s in snapshots
-        if (_age_days(s.get("created")) or 0) >= threshold
+        if (age := _age_days(s.get("created"))) is None or age >= threshold
     ]
-    _state["last_count"] = len(old_snaps)
+    _update(_state, last_count=len(old_snaps))
 
     if not old_snaps and not force:
         return {"sent": False, "reason": "no_old_snapshots", "count": 0}
@@ -215,11 +262,12 @@ def check_and_alert(force: bool = False) -> dict:
     try:
         msg = _compose_email(cfg, old_snaps, test=force and not old_snaps)
         _send_email(cfg, msg)
-        _state["last_alert"] = datetime.now(timezone.utc)
+        _update(_state, last_alert=datetime.now(timezone.utc))
         return {"sent": True, "count": len(old_snaps), "recipients": cfg["alert_to"]}
-    except Exception as exc:
-        _state["last_error"] = str(exc)
-        return {"sent": False, "reason": "smtp_error", "error": str(exc), "count": len(old_snaps)}
+    except Exception:
+        logger.exception("Alerting: snapshots, sending the e-mail failed")
+        _update(_state, last_error=_SMTP_ERROR)
+        return {"sent": False, "reason": "smtp_error", "error": _SMTP_ERROR, "count": len(old_snaps)}
 
 
 # ── Orphan FCD email + check ─────────────────────────────────────────────────
@@ -245,11 +293,11 @@ def _compose_orphan_email(cfg: dict, orphans: list[dict], test: bool = False) ->
         vm_style  = "color:#e67e22;font-weight:600" if attached else "color:#999"
         rows += f"""
         <tr>
-          <td style="padding:7px 12px;border-bottom:1px solid #eee;font-family:monospace;font-size:11px">{o.get('fcd_id') or '—'}</td>
-          <td style="padding:7px 12px;border-bottom:1px solid #eee">{o.get('fcd_name') or '—'}</td>
-          <td style="padding:7px 12px;border-bottom:1px solid #eee">{o.get('datastore') or '—'}</td>
-          <td style="padding:7px 12px;border-bottom:1px solid #eee;text-align:right">{o.get('capacity_gb', 0)} GB</td>
-          <td style="padding:7px 12px;border-bottom:1px solid #eee;{vm_style}">{o.get('vm_name') or '—'}</td>
+          <td style="padding:7px 12px;border-bottom:1px solid #eee;font-family:monospace;font-size:11px">{_e(o.get('fcd_id'))}</td>
+          <td style="padding:7px 12px;border-bottom:1px solid #eee">{_e(o.get('fcd_name'))}</td>
+          <td style="padding:7px 12px;border-bottom:1px solid #eee">{_e(o.get('datastore'))}</td>
+          <td style="padding:7px 12px;border-bottom:1px solid #eee;text-align:right">{_e(o.get('capacity_gb', 0))} GB</td>
+          <td style="padding:7px 12px;border-bottom:1px solid #eee;{vm_style}">{_e(o.get('vm_name'))}</td>
         </tr>"""
 
     table_section = ""
@@ -309,20 +357,20 @@ def check_and_alert_orphans(force: bool = False) -> dict:
     import vcenter_client  # late import — avoids circular dependency at module load
 
     cfg = get_config()
-    _state_orphans["last_check"] = datetime.now(timezone.utc)
-    _state_orphans["last_error"] = None
+    _update(_state_orphans, last_check=datetime.now(timezone.utc), last_error=None)
 
     if not is_configured(cfg):
-        _state_orphans["last_error"] = "SMTP not configured"
+        _update(_state_orphans, last_error="SMTP not configured")
         return {"sent": False, "reason": "not_configured", "count": 0}
 
     try:
         orphans = vcenter_client.get_orphaned_fcds()
-    except Exception as exc:
-        _state_orphans["last_error"] = str(exc)
-        return {"sent": False, "reason": "fetch_error", "error": str(exc), "count": 0}
+    except Exception:
+        logger.exception("Alerting: orphans, vCenter or Kubernetes query failed")
+        _update(_state_orphans, last_error=_FETCH_ERROR)
+        return {"sent": False, "reason": "fetch_error", "error": _FETCH_ERROR, "count": 0}
 
-    _state_orphans["last_count"] = len(orphans)
+    _update(_state_orphans, last_count=len(orphans))
 
     if not orphans and not force:
         return {"sent": False, "reason": "no_orphans", "count": 0}
@@ -330,11 +378,12 @@ def check_and_alert_orphans(force: bool = False) -> dict:
     try:
         msg = _compose_orphan_email(cfg, orphans, test=force and not orphans)
         _send_email(cfg, msg)
-        _state_orphans["last_alert"] = datetime.now(timezone.utc)
+        _update(_state_orphans, last_alert=datetime.now(timezone.utc))
         return {"sent": True, "count": len(orphans), "recipients": cfg["alert_to"]}
-    except Exception as exc:
-        _state_orphans["last_error"] = str(exc)
-        return {"sent": False, "reason": "smtp_error", "error": str(exc), "count": len(orphans)}
+    except Exception:
+        logger.exception("Alerting: orphans, sending the e-mail failed")
+        _update(_state_orphans, last_error=_SMTP_ERROR)
+        return {"sent": False, "reason": "smtp_error", "error": _SMTP_ERROR, "count": len(orphans)}
 
 
 # ── Background scheduler ─────────────────────────────────────────────────────
@@ -354,26 +403,26 @@ async def alert_scheduler() -> None:
     while True:
         # Snapshot age alert
         try:
-            result = check_and_alert()
+            result = await asyncio.to_thread(check_and_alert)
             if result.get("sent"):
                 logger.info("Alerting: snapshots — sent email for %d old snapshots", result.get("count", 0))
             elif result.get("reason") == "no_old_snapshots":
                 logger.info("Alerting: snapshots — none older than %dd", cfg["age_threshold_days"])
             else:
                 logger.warning("Alerting: snapshots — check result: %s", result)
-        except Exception as exc:
-            logger.exception("Alerting: snapshots — unexpected error: %s", exc)
+        except Exception:
+            logger.exception("Alerting: snapshots — unexpected error")
 
         # Orphan FCD alert
         try:
-            result = check_and_alert_orphans()
+            result = await asyncio.to_thread(check_and_alert_orphans)
             if result.get("sent"):
                 logger.info("Alerting: orphans — sent email for %d orphaned FCDs", result.get("count", 0))
             elif result.get("reason") == "no_orphans":
                 logger.info("Alerting: orphans — no orphaned FCDs found")
             else:
                 logger.warning("Alerting: orphans — check result: %s", result)
-        except Exception as exc:
-            logger.exception("Alerting: orphans — unexpected error: %s", exc)
+        except Exception:
+            logger.exception("Alerting: orphans — unexpected error")
 
         await asyncio.sleep(interval_sec)
