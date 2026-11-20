@@ -34,9 +34,10 @@ resources:
     cpu: 500m
 
 # Addresses (comma-separated IPs or CIDRs) whose X-Forwarded-* headers uvicorn
-# trusts. Empty keeps the uvicorn default (loopback only), so the scheme and
-# client address sent by the Gateway are ignored. Set it to the Gateway data-plane
-# pod range so the app sees the original https scheme.
+# trusts; sets FORWARDED_ALLOW_IPS. Empty keeps the uvicorn default (loopback only),
+# so the scheme and client address sent by the Gateway are ignored. With
+# gateway.enabled, set it to the Gateway data-plane pod range so the app sees the
+# original https scheme and client address.
 forwardedAllowIps: ""
 
 # CA bundle used to verify the vCenter TLS certificate. Name an existing ConfigMap
@@ -52,7 +53,8 @@ secret:
   # Use a Secret you manage yourself (must exist in the release namespace).
   # When set, the chart does not create one and cannot check its contents; the
   # application itself refuses to start when authentication is enabled but the
-  # OIDC settings or SESSION_SECRET are missing.
+  # OIDC settings, SESSION_SECRET or ALLOWED_GROUPS are missing. The chart also does
+  # not default TRUSTED_HOSTS and OIDC_REDIRECT_URI then; put them in that Secret.
   existingSecret: ""
   # Otherwise the chart creates a Secret from these values. Supply real values with
   # `--set-file`/a private values file or (better) use existingSecret / an external secret operator.
@@ -63,6 +65,8 @@ secret:
     VCENTER_PORT: "443"
     # Verify the vCenter certificate. Use vcenterCA for a private CA instead of disabling this.
     VCENTER_VERIFY_SSL: "true"
+    # Seconds a request waits for a running vCenter scan before it gets 503 "scan in progress".
+    VCENTER_SCAN_WAIT_SECONDS: "120"
 
     # Email alerting
     SMTP_HOST: ""
@@ -76,29 +80,35 @@ secret:
     # Minimum 1.
     ALERT_CHECK_INTERVAL_HOURS: "24"
 
-    # OIDC authentication. With AUTH_ENABLED other than "false", OIDC_ISSUER,
-    # OIDC_CLIENT_ID, OIDC_CLIENT_SECRET and SESSION_SECRET are required; rendering
-    # fails without them. AUTH_ENABLED: "false" is only accepted when the app is not
-    # exposed (gateway.enabled=false and service.type=ClusterIP).
+    # OIDC authentication. Unless AUTH_ENABLED is false ("false", "0", "no" or "off",
+    # any case), OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, SESSION_SECRET and
+    # ALLOWED_GROUPS are required; rendering fails without them. A false AUTH_ENABLED
+    # is only accepted when the app is not exposed (gateway.enabled=false and
+    # service.type=ClusterIP).
     AUTH_ENABLED: "true"
     OIDC_ISSUER: ""
     OIDC_CLIENT_ID: ""
     OIDC_CLIENT_SECRET: ""
-    # Full callback URL, e.g. https://pvc-monitor.example.com/auth/callback
+    # Full callback URL. Empty with gateway.enabled: https://<gateway.hostname>/auth/callback.
     OIDC_REDIRECT_URI: ""
     OIDC_SCOPES: "openid email profile groups"
-    # Comma-separated groups allowed to access the app; empty allows all authenticated users.
+    # Comma-separated groups allowed to access the app. Required with authentication;
+    # "*" allows every user the identity provider authenticates (logged as a warning).
     ALLOWED_GROUPS: ""
     # At least 32 random characters, e.g. `openssl rand -hex 32`.
     SESSION_SECRET: ""
     SESSION_SECURE: "true"
     SESSION_MAX_AGE_HOURS: "12"
-    # Comma-separated Host header values the app accepts, e.g. the gateway hostname.
+    # Comma-separated Host header values the app accepts. Empty with gateway.enabled:
+    # gateway.hostname.
     TRUSTED_HOSTS: ""
     # Exposes vSphere diagnostics; keep disabled outside troubleshooting.
     ENABLE_DEBUG_ENDPOINT: "false"
 
-# Gateway API exposure.
+# Gateway API exposure. With the chart's own Secret, an empty secret.data.TRUSTED_HOSTS
+# and OIDC_REDIRECT_URI default to this hostname (set them yourself with
+# secret.existingSecret). Also set forwardedAllowIps (above) to the Gateway data-plane
+# addresses, so the app sees the original https scheme and client address.
 gateway:
   enabled: true
   hostname: pvc-monitor.example.com

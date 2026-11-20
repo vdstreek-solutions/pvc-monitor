@@ -52,6 +52,8 @@ VCENTER_CA_FILE = env_str("VCENTER_CA_FILE") or None  # PEM bundle for a private
 VCENTER_CACHE_SECONDS = env_int("VCENTER_CACHE_SECONDS", 60, minimum=0)
 # Socket timeout for each request to vCenter.
 VCENTER_TIMEOUT_SECONDS = 60
+# How long a caller waits for a running scan before it gets "scan in progress".
+VCENTER_SCAN_WAIT_SECONDS = env_int("VCENTER_SCAN_WAIT_SECONDS", 120, minimum=1)
 
 if not VCENTER_VERIFY_SSL:
     logger.warning(
@@ -119,13 +121,18 @@ _scan_cache: dict = {}
 def _single_flight(fn):
     @functools.wraps(fn)
     def wrapper():
-        with _scan_lock:
+        # Waiting is bounded so request threads do not pile up behind a slow scan.
+        if not _scan_lock.acquire(timeout=VCENTER_SCAN_WAIT_SECONDS):
+            raise Unavailable("A vCenter scan is in progress; try again in a minute")
+        try:
             hit = _scan_cache.get(fn.__name__)
             if hit and time.monotonic() - hit[0] < VCENTER_CACHE_SECONDS:
                 return hit[1]
             result = fn()  # failures are not cached
             _scan_cache[fn.__name__] = (time.monotonic(), result)
             return result
+        finally:
+            _scan_lock.release()
     return wrapper
 
 

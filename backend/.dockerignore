@@ -1,3 +1,6 @@
+# Build context of backend/Dockerfile (docker-compose builds with context ./backend,
+# where the repository root .dockerignore does not apply). Keep secrets, local
+# environments, caches and test code out of the image.
 .env
 .env.*
 !.env.example
@@ -7,6 +10,7 @@ __pycache__
 *.py[cod]
 .pytest_cache
 test_*.py
+conftest.py
 tests
 requirements-dev.*
 Dockerfile

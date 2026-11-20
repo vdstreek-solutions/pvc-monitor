@@ -4,7 +4,6 @@ import os
 import secrets
 import time
 from contextlib import asynccontextmanager
-from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -18,7 +17,7 @@ logging.basicConfig(
 
 from fastapi import Depends, FastAPI, HTTPException, Request  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
-from starlette.middleware.base import BaseHTTPMiddleware  # noqa: E402
+from starlette.datastructures import MutableHeaders  # noqa: E402
 from starlette.middleware.sessions import SessionMiddleware  # noqa: E402
 from starlette.middleware.trustedhost import TrustedHostMiddleware  # noqa: E402
 
@@ -57,16 +56,38 @@ async def lifespan(app: FastAPI):
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 # The built SPA loads only its own scripts, styles and assets.
+# frontend/nginx.conf sends the same policy for the SPA; keep both in step.
 _CSP = "default-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+_SECURITY_HEADERS = {
+    "Content-Security-Policy": _CSP,
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+    "X-Frame-Options": "DENY",
+}
 
 
-async def _security_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers.setdefault("Content-Security-Policy", _CSP)
-    response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("Referrer-Policy", "same-origin")
-    response.headers.setdefault("X-Frame-Options", "DENY")
-    return response
+class _SecurityHeaders:
+    """Pure ASGI wrapper around the whole app, including Starlette's error
+    handler, so the headers are also on unhandled 500 responses. A header the
+    response already sets (the auth pages' own CSP) is kept."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                message.setdefault("headers", [])
+                headers = MutableHeaders(scope=message)
+                for name, value in _SECURITY_HEADERS.items():
+                    headers.setdefault(name, value)
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
 
 
 class _TrustedHostMiddleware(TrustedHostMiddleware):
@@ -97,14 +118,7 @@ _last_alert_test: dict[str, float] = {}
 
 def _alert_post_guard(kind: str):
     async def guard(request: Request) -> None:
-        # Browsers send Sec-Fetch-Site; older ones at least send Origin on POST.
-        # Non-browser clients send neither and cannot be driven cross-site.
-        site = request.headers.get("sec-fetch-site")
-        origin = request.headers.get("origin")
-        if site is not None and site != "same-origin":
-            raise HTTPException(status_code=403, detail="Cross-site request refused")
-        if site is None and origin is not None and urlsplit(origin).netloc != request.headers.get("host"):
-            raise HTTPException(status_code=403, detail="Cross-site request refused")
+        auth.require_same_origin(request)
         # Runs on the event loop, so check-and-set needs no lock.
         now = time.monotonic()
         last = _last_alert_test.get(kind)
@@ -136,7 +150,7 @@ def _register_routes(app: FastAPI) -> None:
     # vSphere
     @app.get("/api/health")
     def health():
-        return vcenter_client.check_connectivity()
+        return _call(vcenter_client.check_connectivity)  # 503 while another scan holds the lock
 
     @app.get("/api/persistent-volumes")
     def persistent_volumes():
@@ -247,9 +261,10 @@ def _register_routes(app: FastAPI) -> None:
 # Middleware is applied in LIFO order: the LAST add_middleware call becomes
 # the outermost wrapper (first to receive the request).
 #
-#   Request → security headers → TrustedHost → Session → Auth → routes
+#   Request → security headers → (Starlette error handler) → TrustedHost → Session → Auth → routes
 #
 # SessionMiddleware must wrap AuthMiddleware so AuthMiddleware can read the session.
+# The security headers wrap the stack Starlette builds, outside its error handler.
 
 def create_app() -> FastAPI:
     # The SPA is served from the same origin, so no CORS and no API docs pages.
@@ -273,7 +288,8 @@ def create_app() -> FastAPI:
     )
     if TRUSTED_HOSTS:
         app.add_middleware(_TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
-    app.add_middleware(BaseHTTPMiddleware, dispatch=_security_headers)
+    build_stack = app.build_middleware_stack
+    app.build_middleware_stack = lambda: _SecurityHeaders(build_stack())
 
     app.include_router(auth.router)
     _register_routes(app)

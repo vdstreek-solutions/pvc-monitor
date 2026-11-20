@@ -4,6 +4,7 @@ import logging
 import os
 import smtplib
 import ssl
+import threading
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -39,6 +40,11 @@ _SMTP_ERROR  = "sending the e-mail failed, see the server log"
 
 
 # ── In-memory state ──────────────────────────────────────────────────────────
+#
+# Written by the scheduler thread and by request threads (test alerts, status),
+# so every access goes through _state_lock.
+
+_state_lock = threading.Lock()
 
 _state: dict = {
     "last_check": None,  # datetime
@@ -54,8 +60,19 @@ _state_orphans: dict = {
     "last_error": None,
 }
 
+
+def _update(state: dict, **values) -> None:
+    with _state_lock:
+        state.update(values)
+
+
 def get_status() -> dict:
     cfg = get_config()
+    with _state_lock:
+        return _status(cfg)
+
+
+def _status(cfg: dict) -> dict:
     return {
         # Snapshot alert fields (unchanged — Snapshots.jsx reads these top-level)
         "configured":           is_configured(cfg),
@@ -218,18 +235,17 @@ def check_and_alert(force: bool = False) -> dict:
     import vcenter_client  # late import — avoids circular dependency at module load
 
     cfg = get_config()
-    _state["last_check"] = datetime.now(timezone.utc)
-    _state["last_error"] = None
+    _update(_state, last_check=datetime.now(timezone.utc), last_error=None)
 
     if not is_configured(cfg):
-        _state["last_error"] = "SMTP not configured"
+        _update(_state, last_error="SMTP not configured")
         return {"sent": False, "reason": "not_configured", "count": 0}
 
     try:
         snapshots = vcenter_client.get_snapshots()
     except Exception:
         logger.exception("Alerting: snapshots, vCenter query failed")
-        _state["last_error"] = _FETCH_ERROR
+        _update(_state, last_error=_FETCH_ERROR)
         return {"sent": False, "reason": "fetch_error", "error": _FETCH_ERROR, "count": 0}
 
     # A snapshot without a readable creation time is reported, not skipped.
@@ -238,7 +254,7 @@ def check_and_alert(force: bool = False) -> dict:
         s for s in snapshots
         if (age := _age_days(s.get("created"))) is None or age >= threshold
     ]
-    _state["last_count"] = len(old_snaps)
+    _update(_state, last_count=len(old_snaps))
 
     if not old_snaps and not force:
         return {"sent": False, "reason": "no_old_snapshots", "count": 0}
@@ -246,11 +262,11 @@ def check_and_alert(force: bool = False) -> dict:
     try:
         msg = _compose_email(cfg, old_snaps, test=force and not old_snaps)
         _send_email(cfg, msg)
-        _state["last_alert"] = datetime.now(timezone.utc)
+        _update(_state, last_alert=datetime.now(timezone.utc))
         return {"sent": True, "count": len(old_snaps), "recipients": cfg["alert_to"]}
     except Exception:
         logger.exception("Alerting: snapshots, sending the e-mail failed")
-        _state["last_error"] = _SMTP_ERROR
+        _update(_state, last_error=_SMTP_ERROR)
         return {"sent": False, "reason": "smtp_error", "error": _SMTP_ERROR, "count": len(old_snaps)}
 
 
@@ -341,21 +357,20 @@ def check_and_alert_orphans(force: bool = False) -> dict:
     import vcenter_client  # late import — avoids circular dependency at module load
 
     cfg = get_config()
-    _state_orphans["last_check"] = datetime.now(timezone.utc)
-    _state_orphans["last_error"] = None
+    _update(_state_orphans, last_check=datetime.now(timezone.utc), last_error=None)
 
     if not is_configured(cfg):
-        _state_orphans["last_error"] = "SMTP not configured"
+        _update(_state_orphans, last_error="SMTP not configured")
         return {"sent": False, "reason": "not_configured", "count": 0}
 
     try:
         orphans = vcenter_client.get_orphaned_fcds()
     except Exception:
         logger.exception("Alerting: orphans, vCenter or Kubernetes query failed")
-        _state_orphans["last_error"] = _FETCH_ERROR
+        _update(_state_orphans, last_error=_FETCH_ERROR)
         return {"sent": False, "reason": "fetch_error", "error": _FETCH_ERROR, "count": 0}
 
-    _state_orphans["last_count"] = len(orphans)
+    _update(_state_orphans, last_count=len(orphans))
 
     if not orphans and not force:
         return {"sent": False, "reason": "no_orphans", "count": 0}
@@ -363,11 +378,11 @@ def check_and_alert_orphans(force: bool = False) -> dict:
     try:
         msg = _compose_orphan_email(cfg, orphans, test=force and not orphans)
         _send_email(cfg, msg)
-        _state_orphans["last_alert"] = datetime.now(timezone.utc)
+        _update(_state_orphans, last_alert=datetime.now(timezone.utc))
         return {"sent": True, "count": len(orphans), "recipients": cfg["alert_to"]}
     except Exception:
         logger.exception("Alerting: orphans, sending the e-mail failed")
-        _state_orphans["last_error"] = _SMTP_ERROR
+        _update(_state_orphans, last_error=_SMTP_ERROR)
         return {"sent": False, "reason": "smtp_error", "error": _SMTP_ERROR, "count": len(orphans)}
 
 

@@ -1,6 +1,7 @@
 """Tests for the app wiring in main.py: routes, headers, errors, POST guards, threading."""
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,6 +11,8 @@ import auth
 import main
 import vcenter_client
 from settings import Unavailable
+
+BACKEND = Path(__file__).resolve().parent
 
 
 @pytest.fixture
@@ -57,6 +60,48 @@ def test_security_headers(open_client):
 def test_security_headers_on_unauthenticated_responses():
     client = TestClient(main.app, base_url="https://testserver")
     assert "content-security-policy" in client.get("/api/overview").headers
+
+
+def test_security_headers_on_unhandled_errors(monkeypatch):
+    """A route that raises past every handler still gets the headers on its 500."""
+    monkeypatch.setattr(auth, "AUTH_ENABLED", False)
+    app = main.create_app()
+
+    @app.get("/api/boom")
+    def boom():
+        raise RuntimeError("unhandled")
+
+    response = TestClient(app, raise_server_exceptions=False).get("/api/boom")
+    assert response.status_code == 500
+    assert response.headers["content-security-policy"] == main._CSP
+    assert response.headers["x-frame-options"] == "DENY"
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+def test_nginx_sends_the_app_csp_for_the_spa():
+    nginx = (BACKEND.parent / "frontend" / "nginx.conf").read_text()
+    assert f'add_header Content-Security-Policy "{main._CSP}" always;' in nginx
+
+
+def test_waiting_for_a_running_scan_is_bounded(monkeypatch):
+    monkeypatch.setattr(vcenter_client, "VCENTER_SCAN_WAIT_SECONDS", 0.1)
+    vcenter_client._scan_lock.acquire()
+    try:
+        with pytest.raises(Unavailable, match="scan is in progress"):
+            vcenter_client.get_orphaned_fcds()
+    finally:
+        vcenter_client._scan_lock.release()
+
+
+@pytest.mark.parametrize("path", ["/api/orphaned-fcds", "/api/snapshots", "/api/health"])
+def test_api_answers_503_while_a_scan_holds_the_lock(open_client, monkeypatch, path):
+    monkeypatch.setattr(vcenter_client, "VCENTER_SCAN_WAIT_SECONDS", 0.1)
+    vcenter_client._scan_lock.acquire()
+    try:
+        response = open_client.get(path)
+    finally:
+        vcenter_client._scan_lock.release()
+    assert response.status_code == 503 and "scan is in progress" in response.json()["detail"]
 
 
 def test_unexpected_error_text_not_returned(open_client, monkeypatch, caplog):

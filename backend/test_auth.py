@@ -53,10 +53,23 @@ class TestValidateSettings:
     def test_valid_settings_pass(self):
         auth.validate_settings()
 
-    @pytest.mark.parametrize("name", ["OIDC_ISSUER", "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET", "SESSION_SECRET"])
+    @pytest.mark.parametrize("name", ["OIDC_ISSUER", "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET", "SESSION_SECRET",
+                                      "ALLOWED_GROUPS"])
     def test_missing_setting_refuses_start(self, monkeypatch, name):
-        monkeypatch.setattr(auth, name, "")
+        monkeypatch.setattr(auth, name, set() if name == "ALLOWED_GROUPS" else "")
         with pytest.raises(ConfigError, match=name):
+            auth.validate_settings()
+
+    def test_any_user_wildcard_warns(self, monkeypatch, caplog):
+        monkeypatch.setattr(auth, "ALLOWED_GROUPS", {"*"})
+        monkeypatch.setattr(auth, "ALLOW_ANY_USER", True)
+        with caplog.at_level(logging.WARNING):
+            auth.validate_settings()
+        assert "ALLOWED_GROUPS=*" in caplog.text
+
+    def test_wildcard_cannot_be_mixed_with_groups(self, monkeypatch):
+        monkeypatch.setattr(auth, "ALLOWED_GROUPS", {"*", "ops"})
+        with pytest.raises(ConfigError, match="cannot be combined"):
             auth.validate_settings()
 
     def test_http_issuer_refused(self, monkeypatch):
@@ -102,6 +115,16 @@ def test_start_refused_when_auth_enabled_without_issuer(tmp_path):
     assert "Configuration error" in result.stderr and "OIDC_ISSUER" in result.stderr
 
 
+def test_start_refused_without_allowed_groups(tmp_path):
+    result = _run_main_import(
+        {"PYTHONPATH": str(BACKEND), "AUTH_ENABLED": "true", "OIDC_ISSUER": "https://issuer.test",
+         "OIDC_CLIENT_ID": "x", "OIDC_CLIENT_SECRET": "x", "SESSION_SECRET": "s" * 40},
+        cwd=tmp_path,
+    )
+    assert result.returncode != 0
+    assert "Configuration error" in result.stderr and "ALLOWED_GROUPS" in result.stderr
+
+
 def test_invalid_number_refused_at_start(tmp_path):
     result = _run_main_import(
         {"PYTHONPATH": str(BACKEND), "AUTH_ENABLED": "false", "ALERT_CHECK_INTERVAL_HOURS": "0.5"},
@@ -118,7 +141,7 @@ def test_settings_from_dotenv_reach_every_module(tmp_path):
             (tmp_path / source.name).write_text(source.read_text())
     (tmp_path / ".env").write_text(
         "AUTH_ENABLED=true\nOIDC_ISSUER=https://issuer.test\nOIDC_CLIENT_ID=c\n"
-        "OIDC_CLIENT_SECRET=s\nSESSION_SECRET=" + "k" * 40 + "\n"
+        "OIDC_CLIENT_SECRET=s\nSESSION_SECRET=" + "k" * 40 + "\nALLOWED_GROUPS=ops\n"
         "K8S_SERVER=https://k8s.test\nVCENTER_HOST=vc.test\n"
     )
     result = _run_main_import(
@@ -226,10 +249,68 @@ class TestSession:
         response, _ = sign_in(client, monkeypatch, {**ALLOWED_USER, "groups": groups})
         assert response.headers["location"] == "/auth/forbidden"
 
+    def test_wildcard_admits_any_authenticated_user(self, client, monkeypatch):
+        monkeypatch.setattr(auth, "ALLOWED_GROUPS", {"*"})
+        monkeypatch.setattr(auth, "ALLOW_ANY_USER", True)
+        response, _ = sign_in(client, monkeypatch, {**ALLOWED_USER, "groups": []})
+        assert response.headers["location"] == "/"
+        assert client.get("/api/alerts/status").status_code == 200
+
     def test_missing_id_token_is_refused(self, client, monkeypatch):
         response, _ = sign_in(client, monkeypatch, None)
-        assert response.headers["location"] == "/auth/login"
+        assert response.status_code == 400 and "location" not in response.headers
         assert client.get("/api/alerts/status").status_code == 401
+
+
+class TestLogout:
+    def test_logout_is_a_post_that_ends_the_session(self, client, monkeypatch):
+        sign_in(client, monkeypatch, ALLOWED_USER)
+        response = client.post("/auth/logout", headers={"Sec-Fetch-Site": "same-origin"})
+        assert response.status_code == 303 and response.headers["location"] == "/auth/login"
+        assert client.get("/api/alerts/status").status_code == 401
+
+    def test_get_does_not_log_out(self, client, monkeypatch):
+        sign_in(client, monkeypatch, ALLOWED_USER)
+        assert client.get("/auth/logout").status_code == 405
+        assert client.get("/api/alerts/status").status_code == 200
+
+    @pytest.mark.parametrize("headers", [{"Sec-Fetch-Site": "cross-site"}, {"Origin": "https://evil.test"}])
+    def test_cross_site_logout_refused(self, client, monkeypatch, headers):
+        sign_in(client, monkeypatch, ALLOWED_USER)
+        assert client.post("/auth/logout", headers=headers).status_code == 403
+        assert client.get("/api/alerts/status").status_code == 200
+
+    def test_forbidden_page_signs_out_with_a_form_post(self, client):
+        text = client.get("/auth/forbidden").text
+        assert '<form method="post" action="/auth/logout">' in text
+        assert 'href="/auth/logout"' not in text
+
+
+class TestSignInFailedPage:
+    def test_failed_exchange_shows_page_with_retry_link(self, client, monkeypatch):
+        monkeypatch.setattr(auth, "oauth", SimpleNamespace(dex=FakeDex(error=Exception("issuer mismatch"))))
+        response = client.get("/auth/callback")
+        assert response.status_code == 400
+        assert "location" not in response.headers  # no redirect loop back to the login
+        assert "Sign-in failed" in response.text
+        assert 'href="/auth/login?next=%2F"' in response.text
+        assert "issuer mismatch" not in response.text
+        assert response.headers["content-security-policy"] == auth._FORBIDDEN_CSP
+
+    def test_retry_link_keeps_next_and_is_escaped(self, client, monkeypatch):
+        class Login:
+            async def authorize_redirect(self, request, redirect_uri):
+                from starlette.responses import RedirectResponse
+                return RedirectResponse("https://issuer.test/auth")
+
+            async def authorize_access_token(self, request, **kwargs):
+                raise Exception("bad state")
+
+        monkeypatch.setattr(auth, "oauth", SimpleNamespace(dex=Login()))
+        client.get("/auth/login", params={"next": '/x?a="<b>&c=1'})
+        response = client.get("/auth/callback")
+        assert "<b>" not in response.text and '"<' not in response.text
+        assert "/auth/login?next=%2Fx%3Fa%3D%22%3Cb%3E%26c%3D1" in response.text
 
 
 # ── 403 page and log lines ───────────────────────────────────────────────────
@@ -301,3 +382,65 @@ def test_id_token_claims_pinned(claims, ok):
     else:
         with pytest.raises(InvalidClaimError):
             token.validate()
+
+
+# ── ID token validation through authlib ──────────────────────────────────────
+
+class TestIdTokenValidation:
+    """The registered authlib client validates a real signed ID token.
+
+    Only the metadata download is replaced (the JWKS travels in the metadata,
+    which authlib reads before any jwks_uri); signature, issuer, audience and
+    nonce checks run in authlib and joserfc with auth.claims_options().
+    """
+
+    @pytest.fixture
+    def idp(self, monkeypatch):
+        from authlib.integrations.starlette_client import OAuth
+        from joserfc import jwt
+        from joserfc.jwk import RSAKey
+
+        key = RSAKey.generate_key(2048, parameters={"kid": "k1"})
+        registry = OAuth()
+        monkeypatch.setattr(auth, "oauth", registry)
+        auth.init_oauth()
+        dex = registry.dex
+        dex.server_metadata.update({
+            "issuer": "https://issuer.test",
+            "authorization_endpoint": "https://issuer.test/auth",
+            "token_endpoint": "https://issuer.test/token",
+            "jwks": {"keys": [key.as_dict(private=False)]},
+            "id_token_signing_alg_values_supported": ["RS256"],
+            "_loaded_at": time.time(),  # authlib then skips the download
+        })
+
+        def validate(signing_key=key, **claims):
+            now = int(time.time())
+            payload = {"iss": "https://issuer.test", "sub": "1", "aud": "pvc-monitor",
+                       "exp": now + 300, "iat": now, "nonce": "n-1", **claims}
+            token = {"access_token": "a", "token_type": "Bearer",
+                     "id_token": jwt.encode({"alg": "RS256", "kid": "k1"}, payload, signing_key)}
+            return asyncio.run(dex.parse_id_token(token, nonce="n-1", claims_options=auth.claims_options()))
+
+        return validate
+
+    def test_valid_token_accepted(self, idp):
+        assert idp()["sub"] == "1"
+
+    def test_bad_signature_refused(self, idp):
+        from joserfc.errors import BadSignatureError
+        from joserfc.jwk import RSAKey
+
+        other = RSAKey.generate_key(2048, parameters={"kid": "k1"})  # same kid, other key
+        with pytest.raises(BadSignatureError):
+            idp(signing_key=other)
+
+    @pytest.mark.parametrize("claims", [
+        {"iss": "https://other-issuer.test"},
+        {"aud": "other-client"},
+        {"nonce": "other-nonce"},
+    ])
+    def test_wrong_claim_refused(self, idp, claims):
+        from joserfc.errors import InvalidClaimError
+        with pytest.raises(InvalidClaimError):
+            idp(**claims)

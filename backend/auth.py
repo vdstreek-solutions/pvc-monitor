@@ -5,7 +5,7 @@ import time
 from urllib.parse import quote, urlsplit
 
 from authlib.integrations.starlette_client import OAuth
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import RedirectResponse, JSONResponse, HTMLResponse
@@ -21,6 +21,8 @@ OIDC_CLIENT_SECRET = os.getenv("OIDC_CLIENT_SECRET", "")  # used as given
 OIDC_REDIRECT_URI  = env_str("OIDC_REDIRECT_URI")
 OIDC_SCOPES        = env_str("OIDC_SCOPES", "openid email profile groups")
 ALLOWED_GROUPS     = set(env_list("ALLOWED_GROUPS"))
+# ALLOWED_GROUPS=* lets every user the identity provider authenticates in.
+ALLOW_ANY_USER     = ALLOWED_GROUPS == {"*"}
 
 SESSION_SECRET        = os.getenv("SESSION_SECRET", "")
 SESSION_SECURE        = env_bool("SESSION_SECURE", True)
@@ -58,12 +60,19 @@ def validate_settings() -> None:
         ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
         ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
         ("SESSION_SECRET", SESSION_SECRET),
+        ("ALLOWED_GROUPS", ALLOWED_GROUPS),
     ) if not value]
     if missing:
         raise ConfigError(
             f"AUTH_ENABLED is true but {', '.join(missing)} {'is' if len(missing) == 1 else 'are'} not set. "
             "Set AUTH_ENABLED=false to run without login (local development only)."
+            + (" ALLOWED_GROUPS takes group names, or * for every authenticated user."
+               if "ALLOWED_GROUPS" in missing else "")
         )
+    if "*" in ALLOWED_GROUPS and not ALLOW_ANY_USER:
+        raise ConfigError("ALLOWED_GROUPS=* cannot be combined with group names")
+    if ALLOW_ANY_USER:
+        logger.warning("Auth: ALLOWED_GROUPS=*, every user the identity provider authenticates is allowed in")
     issuer = urlsplit(OIDC_ISSUER)
     local = issuer.hostname in ("localhost", "127.0.0.1", "::1")
     if issuer.scheme != "https" and not (issuer.scheme == "http" and local):
@@ -93,10 +102,7 @@ def init_oauth() -> None:
             "code_challenge_method": "S256",  # PKCE
         },
     )
-    if ALLOWED_GROUPS:
-        logger.info("Auth: OIDC ready, issuer=%s allowed_groups=%s", OIDC_ISSUER, sorted(ALLOWED_GROUPS))
-    else:
-        logger.info("Auth: OIDC ready, issuer=%s (all authenticated users allowed)", OIDC_ISSUER)
+    logger.info("Auth: OIDC ready, issuer=%s allowed_groups=%s", OIDC_ISSUER, sorted(ALLOWED_GROUPS))
 
 
 def auth_active() -> bool:
@@ -193,20 +199,20 @@ async def callback(request: Request):
         token = await oauth.dex.authorize_access_token(request, claims_options=claims_options())
     except Exception as exc:
         logger.warning("Auth: token exchange failed: %r", str(exc))
-        return RedirectResponse(url="/auth/login")
+        return _sign_in_failed(request)
 
     # Only claims from a validated ID token are trusted.
     userinfo = token.get("userinfo")
     if not userinfo:
         logger.warning("Auth: token response has no validated ID token")
-        return RedirectResponse(url="/auth/login")
+        return _sign_in_failed(request)
 
     email = userinfo.get("email") or ""
     name = userinfo.get("name") or userinfo.get("preferred_username") or email
     groups = _string_list(userinfo.get("groups"))
     matched = sorted(set(groups) & ALLOWED_GROUPS)
 
-    if ALLOWED_GROUPS and not matched:
+    if not ALLOW_ANY_USER and not matched:
         logger.warning(
             "Auth: access denied, %r groups=%r not in allowed=%s",
             email, groups, sorted(ALLOWED_GROUPS),
@@ -229,16 +235,83 @@ async def callback(request: Request):
     return RedirectResponse(url=next_url)
 
 
-@router.get("/auth/logout")
+def require_same_origin(request: Request) -> None:
+    """Refuse a state-changing request that a browser sends from another site."""
+    # Browsers send Sec-Fetch-Site; older ones at least send Origin on POST.
+    # Non-browser clients send neither and cannot be driven cross-site.
+    site = request.headers.get("sec-fetch-site")
+    origin = request.headers.get("origin")
+    if site is not None and site != "same-origin":
+        raise HTTPException(status_code=403, detail="Cross-site request refused")
+    if site is None and origin is not None and urlsplit(origin).netloc != request.headers.get("host"):
+        raise HTTPException(status_code=403, detail="Cross-site request refused")
+
+
+@router.post("/auth/logout", dependencies=[Depends(require_same_origin)])
 async def logout(request: Request):
     user = request.session.get("user") or {}
     logger.info("Auth: logout %r", user.get("email", "unknown"))
     request.session.clear()
-    return RedirectResponse(url="/auth/login" if auth_active() else "/")
+    # 303 so the browser follows with a GET instead of repeating the POST.
+    return RedirectResponse(url="/auth/login" if auth_active() else "/", status_code=303)
 
 
-# The page carries its own inline <style>, so it gets its own policy.
+# The pages carry their own inline <style>, so they get their own policy.
+# No form-action: the sign-out form's redirect chain ends at the identity provider.
 _FORBIDDEN_CSP = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'"
+
+
+def _page(title: str, heading: str, details: str, link_url: str, link_text: str, status_code: int,
+          post: bool = False) -> HTMLResponse:
+    """A small stand-alone page. title, heading and link_text are fixed text;
+    details is markup the caller has escaped; link_url is escaped here.
+    post=True renders the link as a button that POSTs to link_url."""
+    if post:
+        action = f'<form method="post" action="{html.escape(link_url)}"><button type="submit">{link_text}</button></form>'
+    else:
+        action = f'<a href="{html.escape(link_url)}">{link_text}</a>'
+    page = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>{title} — PVC Monitor</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           background: #0d1117; color: #e6edf3; display: flex; align-items: center;
+           justify-content: center; min-height: 100vh; margin: 0; }}
+    .card {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+             padding: 40px; max-width: 480px; width: 100%; text-align: center; }}
+    h1 {{ color: #f85149; margin: 0 0 8px; font-size: 22px; }}
+    p  {{ color: #8b949e; margin: 8px 0; font-size: 14px; line-height: 1.6; }}
+    .tag {{ display: inline-block; background: #21262d; border: 1px solid #30363d;
+            border-radius: 4px; padding: 2px 8px; font-family: monospace; font-size: 12px;
+            color: #e6edf3; }}
+    a, button {{ display: inline-block; margin-top: 24px; padding: 8px 20px; background: #21262d;
+          border: 1px solid #30363d; border-radius: 6px; color: #8b949e; font: inherit;
+          text-decoration: none; font-size: 13px; cursor: pointer; transition: color .15s, border-color .15s; }}
+    a:hover, button:hover {{ color: #e6edf3; border-color: #8b949e; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>{heading}</h1>{details}
+    {action}
+  </div>
+</body>
+</html>"""
+    return HTMLResponse(content=page, status_code=status_code, headers={"Content-Security-Policy": _FORBIDDEN_CSP})
+
+
+def _sign_in_failed(request: Request) -> HTMLResponse:
+    """Shown instead of redirecting to the login again, which can loop when the
+    issuer is misconfigured. The retry link keeps the page the user asked for."""
+    next_url = _safe_next(request.session.get("next", "/"))
+    return _page(
+        "Sign-in failed", "Sign-in failed",
+        "\n    <p>The sign-in could not be completed. If this keeps happening, the identity "
+        "provider settings may be wrong; the server log has the details.</p>",
+        "/auth/login?next=" + quote(next_url, safe=""), "Try again", 400,
+    )
 
 
 @router.get("/auth/forbidden")
@@ -257,39 +330,8 @@ async def forbidden(request: Request):
     </p>"""
     else:
         details = "\n    <p>You do not have access to this application.</p>"
-    page = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>Access Denied — PVC Monitor</title>
-  <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-           background: #0d1117; color: #e6edf3; display: flex; align-items: center;
-           justify-content: center; min-height: 100vh; margin: 0; }}
-    .card {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px;
-             padding: 40px; max-width: 480px; width: 100%; text-align: center; }}
-    h1 {{ color: #f85149; margin: 0 0 8px; font-size: 22px; }}
-    p  {{ color: #8b949e; margin: 8px 0; font-size: 14px; line-height: 1.6; }}
-    .tag {{ display: inline-block; background: #21262d; border: 1px solid #30363d;
-            border-radius: 4px; padding: 2px 8px; font-family: monospace; font-size: 12px;
-            color: #e6edf3; }}
-    a  {{ display: inline-block; margin-top: 24px; padding: 8px 20px; background: #21262d;
-          border: 1px solid #30363d; border-radius: 6px; color: #8b949e;
-          text-decoration: none; font-size: 13px; transition: color .15s, border-color .15s; }}
-    a:hover {{ color: #e6edf3; border-color: #8b949e; }}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>&#x26D4; Access Denied</h1>{details}
-    <a href="/auth/logout">Sign out and try a different account</a>
-  </div>
-</body>
-</html>"""
-    return HTMLResponse(
-        content=page, status_code=403,
-        headers={"Content-Security-Policy": _FORBIDDEN_CSP},
-    )
+    return _page("Access Denied", "&#x26D4; Access Denied", details,
+                 "/auth/logout", "Sign out and try a different account", 403, post=True)
 
 
 @router.get("/auth/user")

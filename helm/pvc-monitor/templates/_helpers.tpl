@@ -66,14 +66,15 @@ Render-time safety checks. Included at the top of every template so the same
 {{- $d := .Values.secret.data -}}
 {{- $exposed := or .Values.gateway.enabled (ne .Values.service.type "ClusterIP") -}}
 {{- if not .Values.secret.existingSecret -}}
-{{- if eq (toString $d.AUTH_ENABLED | lower) "false" -}}
+{{- /* The same spellings the application reads as false (settings.env_bool). */ -}}
+{{- if has (toString $d.AUTH_ENABLED | trim | lower) (list "false" "0" "no" "off") -}}
 {{- if $exposed -}}
-{{- fail "Authentication is off (secret.data.AUTH_ENABLED=\"false\") while the app is exposed (gateway.enabled=true or service.type is not ClusterIP). Configure OIDC, or disable gateway and keep service.type=ClusterIP." -}}
+{{- fail (printf "Authentication is off (secret.data.AUTH_ENABLED=%q) while the app is exposed (gateway.enabled=true or service.type is not ClusterIP). Configure OIDC, or disable gateway and keep service.type=ClusterIP." (toString $d.AUTH_ENABLED)) -}}
 {{- end -}}
 {{- else -}}
-{{- range $k := list "OIDC_ISSUER" "OIDC_CLIENT_ID" "OIDC_CLIENT_SECRET" "SESSION_SECRET" -}}
+{{- range $k := list "OIDC_ISSUER" "OIDC_CLIENT_ID" "OIDC_CLIENT_SECRET" "SESSION_SECRET" "ALLOWED_GROUPS" -}}
 {{- if not (index $d $k) -}}
-{{- fail (printf "Authentication is enabled (secret.data.AUTH_ENABLED is not \"false\") but secret.data.%s is empty. Set OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET and SESSION_SECRET, or use secret.existingSecret. Running without login requires AUTH_ENABLED=\"false\" with gateway.enabled=false." $k) -}}
+{{- fail (printf "Authentication is enabled (secret.data.AUTH_ENABLED is not false) but secret.data.%s is empty. Set OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, SESSION_SECRET and ALLOWED_GROUPS (group names, or \"*\" for every authenticated user), or use secret.existingSecret. Running without login requires AUTH_ENABLED=\"false\" with gateway.enabled=false." $k) -}}
 {{- end -}}
 {{- end -}}
 {{- if lt (len (toString $d.SESSION_SECRET)) 32 -}}

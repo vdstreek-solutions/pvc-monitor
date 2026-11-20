@@ -10,6 +10,7 @@
 **/node_modules
 **/dist
 **/test_*.py
+**/conftest.py
 **/tests
 .git
 .gitignore

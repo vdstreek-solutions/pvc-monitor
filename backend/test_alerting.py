@@ -390,3 +390,21 @@ class TestGetStatus:
         assert status["last_check"] is not None
         assert status["last_alert"] is not None
         assert status["last_old_snap_count"] == 1
+
+
+def test_state_reads_and_writes_take_the_lock():
+    """get_status and state updates wait while another thread holds the state lock."""
+    import threading
+
+    with patch.dict(os.environ, SMTP_ENV, clear=False):
+        with alerting._state_lock:
+            threads = [threading.Thread(target=alerting.get_status),
+                       threading.Thread(target=alerting._update, args=(alerting._state,), kwargs={"last_count": 5})]
+            for t in threads:
+                t.start()
+                t.join(0.2)
+                assert t.is_alive()
+            assert alerting._state["last_count"] is None
+        for t in threads:
+            t.join()
+    assert alerting._state["last_count"] == 5
